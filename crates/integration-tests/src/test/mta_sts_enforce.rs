@@ -108,9 +108,73 @@ DeliverySummary {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum TlsBackend {
+    OpenSsl,
+    #[cfg(target_os = "linux")]
+    Rustls,
+}
+
+impl TlsBackend {
+    fn as_env(self) -> &'static str {
+        match self {
+            Self::OpenSsl => "openssl",
+            #[cfg(target_os = "linux")]
+            Self::Rustls => "rustls",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaneMode {
+    Matching,
+    Mismatch,
+    Unusable,
+    Absent,
+    ServFail,
+}
+
+impl DaneMode {
+    fn as_env(self) -> &'static str {
+        match self {
+            Self::Matching => "matching",
+            Self::Mismatch => "mismatch",
+            Self::Unusable => "unusable",
+            Self::Absent => "absent",
+            Self::ServFail => "servfail",
+        }
+    }
+}
+
+struct EnforceAfterNoneCase {
+    aggressive: bool,
+    untrusted_tls: bool,
+}
+
+struct SessionReuseCase {
+    backend: TlsBackend,
+    dane: Option<DaneMode>,
+    route_port: bool,
+}
+
+struct DaneBypassCase {
+    mta_sts_enabled: bool,
+    secure_creator: bool,
+}
+
+struct DaneReuseCase {
+    mode: DaneMode,
+    mta_sts_enabled: bool,
+    refresh: bool,
+}
+
 /// An enforcing recipient must not inherit the weaker policy of a domain with
 /// identical MX records. Both messages reach one source/MX ready queue.
-async fn enforce_after_none(aggressive: bool, untrusted_tls: bool) -> anyhow::Result<()> {
+async fn enforce_after_none(case: EnforceAfterNoneCase) -> anyhow::Result<()> {
+    let EnforceAfterNoneCase {
+        aggressive,
+        untrusted_tls,
+    } = case;
     let mut options = DaemonWithMaildirOptions::new().policy_file("mta-sts.lua");
     if aggressive {
         options = options.env("KUMOD_AGGRESSIVE_MTA_STS", "1");
@@ -188,17 +252,29 @@ async fn enforce_after_none(aggressive: bool, untrusted_tls: bool) -> anyhow::Re
 
 #[tokio::test]
 async fn mta_sts_enforce_shared_mx_after_none() -> anyhow::Result<()> {
-    enforce_after_none(false, false).await
+    enforce_after_none(EnforceAfterNoneCase {
+        aggressive: false,
+        untrusted_tls: false,
+    })
+    .await
 }
 
 #[tokio::test]
 async fn mta_sts_enforce_shared_mx_aggressive_opening() -> anyhow::Result<()> {
-    enforce_after_none(true, false).await
+    enforce_after_none(EnforceAfterNoneCase {
+        aggressive: true,
+        untrusted_tls: false,
+    })
+    .await
 }
 
 #[tokio::test]
 async fn mta_sts_enforce_shared_mx_after_untrusted_tls() -> anyhow::Result<()> {
-    enforce_after_none(false, true).await
+    enforce_after_none(EnforceAfterNoneCase {
+        aggressive: false,
+        untrusted_tls: true,
+    })
+    .await
 }
 
 fn trusted_sink(names: &[&str]) -> anyhow::Result<(tempfile::TempDir, DaemonWithMaildirOptions)> {
@@ -236,22 +312,23 @@ fn trusted_sink(names: &[&str]) -> anyhow::Result<(tempfile::TempDir, DaemonWith
     Ok((dir, options))
 }
 
-async fn reuse_validated_session(
-    backend: &str,
-    dane: Option<&str>,
-    route_port: bool,
-) -> anyhow::Result<()> {
+async fn reuse_validated_session(case: SessionReuseCase) -> anyhow::Result<()> {
+    let SessionReuseCase {
+        backend,
+        dane,
+        route_port,
+    } = case;
     // The DANE certificate deliberately fails PKIX hostname validation.
-    let name = if dane.is_some_and(|mode| mode != "absent") {
+    let name = if dane.is_some_and(|mode| mode != DaneMode::Absent) {
         "not-the-mx.example.com"
     } else {
         "mail.shared.example.com"
     };
     let (_ca, mut options) = trusted_sink(&[name])?;
-    options = options.env("KUMOD_MTA_STS_TLS_BACKEND", backend);
+    options = options.env("KUMOD_MTA_STS_TLS_BACKEND", backend.as_env());
     if let Some(mode) = dane {
         options = options
-            .env("KUMOD_MTA_STS_DANE", mode)
+            .env("KUMOD_MTA_STS_DANE", mode.as_env())
             .env("KUMOD_MTA_STS_TLS", "Required");
     }
     if route_port {
@@ -301,7 +378,12 @@ async fn reuse_validated_session(
 
 #[tokio::test]
 async fn mta_sts_reuses_pkix_validated_shared_mx() -> anyhow::Result<()> {
-    reuse_validated_session("openssl", None, false).await
+    reuse_validated_session(SessionReuseCase {
+        backend: TlsBackend::OpenSsl,
+        dane: None,
+        route_port: false,
+    })
+    .await
 }
 
 // rustls uses the system keychain on macOS rather than SSL_CERT_FILE.
@@ -309,12 +391,22 @@ async fn mta_sts_reuses_pkix_validated_shared_mx() -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn mta_sts_reuses_pkix_validated_shared_mx_rustls() -> anyhow::Result<()> {
-    reuse_validated_session("rustls", None, false).await
+    reuse_validated_session(SessionReuseCase {
+        backend: TlsBackend::Rustls,
+        dane: None,
+        route_port: false,
+    })
+    .await
 }
 
 #[tokio::test]
 async fn mta_sts_reuses_dane_same_domain() -> anyhow::Result<()> {
-    reuse_validated_session("openssl", Some("1"), false).await
+    reuse_validated_session(SessionReuseCase {
+        backend: TlsBackend::OpenSsl,
+        dane: Some(DaneMode::Matching),
+        route_port: false,
+    })
+    .await
 }
 
 #[tokio::test]
@@ -448,10 +540,10 @@ async fn update_policy(control: &Path, domain: &str, policy: &str) -> anyhow::Re
     wait_file(&ack).await
 }
 
-async fn reject_wrong_hostname(backend: &str) -> anyhow::Result<()> {
+async fn reject_wrong_hostname(backend: TlsBackend) -> anyhow::Result<()> {
     let (_ca, options) = trusted_sink(&["not-the-mx.example.com"])?;
     let mut daemon = options
-        .env("KUMOD_MTA_STS_TLS_BACKEND", backend)
+        .env("KUMOD_MTA_STS_TLS_BACKEND", backend.as_env())
         .env("KUMOD_UNTRUSTED_MTA_STS_TLS", "1")
         .start()
         .await?;
@@ -477,10 +569,10 @@ async fn reject_wrong_hostname(backend: &str) -> anyhow::Result<()> {
         .iter()
         .find(|r| r.kind == TransientFailure)
         .context("expected hostname-validation failure")?;
-    let expected_error = if backend == "rustls" {
-        "certificate not valid for name"
-    } else {
-        "certificate verify failed"
+    let expected_error = match backend {
+        TlsBackend::OpenSsl => "certificate verify failed",
+        #[cfg(target_os = "linux")]
+        TlsBackend::Rustls => "certificate not valid for name",
     };
     anyhow::ensure!(
         failure.response.content.contains(expected_error),
@@ -493,13 +585,13 @@ async fn reject_wrong_hostname(backend: &str) -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn mta_sts_rejects_trusted_wrong_hostname() -> anyhow::Result<()> {
-    reject_wrong_hostname("openssl").await
+    reject_wrong_hostname(TlsBackend::OpenSsl).await
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn mta_sts_rejects_trusted_wrong_hostname_rustls() -> anyhow::Result<()> {
-    reject_wrong_hostname("rustls").await
+    reject_wrong_hostname(TlsBackend::Rustls).await
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -787,7 +879,10 @@ async fn mta_sts_policy_reconnect_validates_without_retrying_message() -> anyhow
 #[tokio::test]
 async fn mta_sts_dane_proof_is_not_pkix_proof() -> anyhow::Result<()> {
     let (_ca, options) = trusted_sink(&["not-the-mx.example.com"])?;
-    let mut daemon = options.env("KUMOD_MTA_STS_DANE", "1").start().await?;
+    let mut daemon = options
+        .env("KUMOD_MTA_STS_DANE", DaneMode::Matching.as_env())
+        .start()
+        .await?;
     let mut client = daemon.smtp_client().await?;
     send(&mut client, "first@enforce.example.com").await?;
     anyhow::ensure!(
@@ -822,34 +917,53 @@ async fn mta_sts_dane_proof_is_not_pkix_proof() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn mta_sts_reuses_pkix_port_qualified_route() -> anyhow::Result<()> {
-    reuse_validated_session("openssl", None, true).await
+    reuse_validated_session(SessionReuseCase {
+        backend: TlsBackend::OpenSsl,
+        dane: None,
+        route_port: true,
+    })
+    .await
 }
 
 #[tokio::test]
 async fn mta_sts_reuses_dane_unusable_same_domain() -> anyhow::Result<()> {
-    reuse_validated_session("openssl", Some("unusable"), false).await
+    reuse_validated_session(SessionReuseCase {
+        backend: TlsBackend::OpenSsl,
+        dane: Some(DaneMode::Unusable),
+        route_port: false,
+    })
+    .await
 }
 
 #[tokio::test]
 async fn mta_sts_reuses_pkix_when_dane_absent() -> anyhow::Result<()> {
-    reuse_validated_session("openssl", Some("absent"), false).await
+    reuse_validated_session(SessionReuseCase {
+        backend: TlsBackend::OpenSsl,
+        dane: Some(DaneMode::Absent),
+        route_port: false,
+    })
+    .await
 }
 
-async fn pkix_proof_does_not_bypass_dane(no_sts: bool, secure_creator: bool) -> anyhow::Result<()> {
+async fn pkix_proof_does_not_bypass_dane(case: DaneBypassCase) -> anyhow::Result<()> {
+    let DaneBypassCase {
+        mta_sts_enabled,
+        secure_creator,
+    } = case;
     let (_ca, options) = trusted_sink(&["mail.shared.example.com"])?;
-    let options = if no_sts {
+    let options = if !mta_sts_enabled {
         options.env("KUMOD_MTA_STS_NO_STS", "1")
     } else {
         options
     };
     let mut daemon = options
-        .env("KUMOD_MTA_STS_DANE", "mismatch")
+        .env("KUMOD_MTA_STS_DANE", DaneMode::Mismatch.as_env())
         .env("KUMOD_MTA_STS_NO_RETRY", "1")
         .start()
         .await?;
     let mut client = daemon.smtp_client().await?;
-    // A secure creator used to make all new connections apply DANE. Per-message
-    // selection must not let a later PKIX connection bypass that requirement.
+    // A PKIX session for an unsigned domain must not satisfy a secure domain's
+    // DANE requirement, regardless of which domain creates the queue.
     if secure_creator {
         send(&mut client, "first@enforce.example.com").await?;
         anyhow::ensure!(
@@ -893,19 +1007,35 @@ async fn pkix_proof_does_not_bypass_dane(no_sts: bool, secure_creator: bool) -> 
 
 #[tokio::test]
 async fn mta_sts_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
-    pkix_proof_does_not_bypass_dane(false, true).await
+    pkix_proof_does_not_bypass_dane(DaneBypassCase {
+        mta_sts_enabled: true,
+        secure_creator: true,
+    })
+    .await
 }
 #[tokio::test]
 async fn mta_sts_disabled_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
-    pkix_proof_does_not_bypass_dane(true, true).await
+    pkix_proof_does_not_bypass_dane(DaneBypassCase {
+        mta_sts_enabled: false,
+        secure_creator: true,
+    })
+    .await
 }
 #[tokio::test]
 async fn mta_sts_dane_checks_unsigned_creator() -> anyhow::Result<()> {
-    pkix_proof_does_not_bypass_dane(false, false).await
+    pkix_proof_does_not_bypass_dane(DaneBypassCase {
+        mta_sts_enabled: true,
+        secure_creator: false,
+    })
+    .await
 }
 #[tokio::test]
 async fn mta_sts_disabled_dane_checks_unsigned_creator() -> anyhow::Result<()> {
-    pkix_proof_does_not_bypass_dane(true, false).await
+    pkix_proof_does_not_bypass_dane(DaneBypassCase {
+        mta_sts_enabled: false,
+        secure_creator: false,
+    })
+    .await
 }
 
 async fn testing_then_none(tls: &str, hide_starttls: bool) -> anyhow::Result<()> {
@@ -1196,17 +1326,22 @@ async fn mta_sts_peer_close_precedes_policy_reconnect() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn reuse_dane_across_domains(mode: &str, no_sts: bool, refresh: bool) -> anyhow::Result<()> {
+async fn reuse_dane_across_domains(case: DaneReuseCase) -> anyhow::Result<()> {
+    let DaneReuseCase {
+        mode,
+        mta_sts_enabled,
+        refresh,
+    } = case;
     let control = tempfile::tempdir()?;
-    let (_ca, mut options) = trusted_sink(&[if mode == "absent" {
+    let (_ca, mut options) = trusted_sink(&[if mode == DaneMode::Absent {
         "mail.shared.example.com"
     } else {
         "not-the-mx.example.com"
     }])?;
     options = options
-        .env("KUMOD_MTA_STS_DANE", mode)
+        .env("KUMOD_MTA_STS_DANE", mode.as_env())
         .env("KUMOD_MTA_STS_TLS", "Required");
-    if no_sts {
+    if !mta_sts_enabled {
         options = options.env("KUMOD_MTA_STS_NO_STS", "1");
     }
     if refresh {
@@ -1245,44 +1380,70 @@ async fn reuse_dane_across_domains(mode: &str, no_sts: bool, refresh: bool) -> a
 
 #[tokio::test]
 async fn mta_sts_dane_reuses_across_domains() -> anyhow::Result<()> {
-    reuse_dane_across_domains("matching", false, false).await
+    reuse_dane_across_domains(DaneReuseCase {
+        mode: DaneMode::Matching,
+        mta_sts_enabled: true,
+        refresh: false,
+    })
+    .await
 }
 #[tokio::test]
 async fn mta_sts_disabled_dane_reuses_across_domains() -> anyhow::Result<()> {
-    reuse_dane_across_domains("matching", true, false).await
+    reuse_dane_across_domains(DaneReuseCase {
+        mode: DaneMode::Matching,
+        mta_sts_enabled: false,
+        refresh: false,
+    })
+    .await
 }
 #[tokio::test]
 async fn mta_sts_dane_absence_reuses_across_domains() -> anyhow::Result<()> {
-    reuse_dane_across_domains("absent", false, false).await
+    reuse_dane_across_domains(DaneReuseCase {
+        mode: DaneMode::Absent,
+        mta_sts_enabled: true,
+        refresh: false,
+    })
+    .await
 }
 #[tokio::test]
 async fn mta_sts_dane_unusable_reuses_across_domains() -> anyhow::Result<()> {
-    reuse_dane_across_domains("unusable", false, false).await
+    reuse_dane_across_domains(DaneReuseCase {
+        mode: DaneMode::Unusable,
+        mta_sts_enabled: true,
+        refresh: false,
+    })
+    .await
 }
 #[tokio::test]
 async fn mta_sts_dane_refresh_identical_records_reuses() -> anyhow::Result<()> {
-    reuse_dane_across_domains("matching", false, true).await
+    reuse_dane_across_domains(DaneReuseCase {
+        mode: DaneMode::Matching,
+        mta_sts_enabled: true,
+        refresh: true,
+    })
+    .await
 }
 
-async fn update_dane(control: &Path, mode: &str) -> anyhow::Result<()> {
+async fn update_dane(control: &Path, mode: DaneMode) -> anyhow::Result<()> {
     let ack = control.join("dane-applied");
     if ack.exists() {
         std::fs::remove_file(&ack)?;
     }
-    std::fs::write(control.join("dane-mode.tmp"), mode)?;
+    std::fs::write(control.join("dane-mode.tmp"), mode.as_env())?;
     std::fs::rename(control.join("dane-mode.tmp"), control.join("dane-mode"))?;
     wait_file(&ack).await
 }
 
 async fn dane_policy_transition(
-    initial: &str,
-    next: &str,
-    expect_delivery: bool,
+    initial: DaneMode,
+    next: DaneMode,
+    expected: kumo_log_types::RecordType,
 ) -> anyhow::Result<()> {
+    let expect_delivery = expected == Delivery;
     let control = tempfile::tempdir()?;
     let (_ca, options) = trusted_sink(&["mail.shared.example.com"])?;
     let mut daemon = options
-        .env("KUMOD_MTA_STS_DANE", initial)
+        .env("KUMOD_MTA_STS_DANE", initial.as_env())
         .env("KUMOD_MTA_STS_NO_STS", "1")
         .env("KUMOD_MTA_STS_TLS", "Disabled")
         .env("KUMOD_MTA_STS_NO_RETRY", "1")
@@ -1323,13 +1484,8 @@ async fn dane_policy_transition(
         })
         .context("second result")?;
     anyhow::ensure!(
-        second.kind
-            == if expect_delivery {
-                Delivery
-            } else {
-                TransientFailure
-            },
-        "{initial} → {next}: {second:?}"
+        second.kind == expected,
+        "{initial:?} → {next:?}: {second:?}"
     );
     if expect_delivery {
         anyhow::ensure!(second.tls_cipher.is_some());
@@ -1341,19 +1497,19 @@ async fn dane_policy_transition(
 }
 #[tokio::test]
 async fn mta_sts_disabled_dane_rechecks_changed_records() -> anyhow::Result<()> {
-    dane_policy_transition("matching", "mismatch", false).await
+    dane_policy_transition(DaneMode::Matching, DaneMode::Mismatch, TransientFailure).await
 }
 #[tokio::test]
 async fn mta_sts_disabled_dane_rechecks_temporary_failure() -> anyhow::Result<()> {
-    dane_policy_transition("matching", "servfail", false).await
+    dane_policy_transition(DaneMode::Matching, DaneMode::ServFail, TransientFailure).await
 }
 #[tokio::test]
 async fn mta_sts_disabled_dane_upgrades_plaintext() -> anyhow::Result<()> {
-    dane_policy_transition("absent", "matching", true).await
+    dane_policy_transition(DaneMode::Absent, DaneMode::Matching, Delivery).await
 }
 #[tokio::test]
 async fn mta_sts_disabled_dane_unusable_requires_encryption() -> anyhow::Result<()> {
-    dane_policy_transition("absent", "unusable", true).await
+    dane_policy_transition(DaneMode::Absent, DaneMode::Unusable, Delivery).await
 }
 
 #[tokio::test]

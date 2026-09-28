@@ -183,14 +183,14 @@ impl MxListEntry {
 #[derive(Debug, Clone, PartialEq)]
 enum DaneRequirement {
     NotApplicable,
-    Authenticated(Vec<TLSA>),
+    AuthenticationRequired(Vec<TLSA>),
     EncryptionRequired,
 }
 
 /// Apply the same precedence for new connections and connection reuse.
 fn effective_tls(configured: Tls, mta_sts: PolicyMode, dane: &DaneRequirement) -> Tls {
     match (dane, mta_sts) {
-        (DaneRequirement::Authenticated(_), _) | (_, PolicyMode::Enforce) => Tls::Required,
+        (DaneRequirement::AuthenticationRequired(_), _) | (_, PolicyMode::Enforce) => Tls::Required,
         (DaneRequirement::EncryptionRequired, _) => Tls::RequiredInsecure,
         (DaneRequirement::NotApplicable, PolicyMode::Testing) => Tls::OpportunisticInsecure,
         (DaneRequirement::NotApplicable, PolicyMode::None) => configured,
@@ -497,7 +497,9 @@ impl SmtpDispatcher {
         };
         let tls = effective_tls(path.enable_tls, mode, &dane);
         let authenticated = match &dane {
-            DaneRequirement::Authenticated(records) => self.dane_verified.as_ref() == Some(records),
+            DaneRequirement::AuthenticationRequired(records) => {
+                self.dane_verified.as_ref() == Some(records)
+            }
             _ => self
                 .pkix_verified_mx
                 .as_ref()
@@ -904,7 +906,7 @@ impl SmtpDispatcher {
             )
             .await?;
         let dane_tlsa = match &dane_requirement {
-            DaneRequirement::Authenticated(records) => records.clone(),
+            DaneRequirement::AuthenticationRequired(records) => records.clone(),
             _ => vec![],
         };
 
@@ -916,7 +918,7 @@ impl SmtpDispatcher {
             PolicyMode::None
         };
         let enable_tls = effective_tls(path_config.enable_tls, mta_sts, &dane_requirement);
-        if !matches!(dane_requirement, DaneRequirement::Authenticated(_))
+        if !matches!(dane_requirement, DaneRequirement::AuthenticationRequired(_))
             && mta_sts != PolicyMode::None
         {
             self.tracer.diagnostic(Level::INFO, || {
@@ -924,7 +926,7 @@ impl SmtpDispatcher {
             });
         }
         let pkix_verification = !enable_tls.allow_insecure()
-            && !matches!(dane_requirement, DaneRequirement::Authenticated(_));
+            && !matches!(dane_requirement, DaneRequirement::AuthenticationRequired(_));
         let prefer_openssl = path_config.tls_prefer_openssl;
 
         // A couple of little helper types to make the match statement below
@@ -1180,7 +1182,7 @@ impl SmtpDispatcher {
         self.peer_has_starttls = matches!(has_tls, AdvTls::Yes);
         self.tls_was_disabled = enable_tls == Tls::Disabled;
         self.dane_verified = match dane_requirement {
-            DaneRequirement::Authenticated(records)
+            DaneRequirement::AuthenticationRequired(records)
                 if tls_enabled
                     && self
                         .tls_info
@@ -1278,7 +1280,7 @@ impl SmtpDispatcher {
                         self.tracer.diagnostic(Level::INFO, || {
                             format!("DANE records for {} are: {tlsa:?}", address.name)
                         });
-                        return Ok(DaneRequirement::Authenticated(tlsa));
+                        return Ok(DaneRequirement::AuthenticationRequired(tlsa));
                     }
                     DaneStatus::Unusable => {
                         record_dane_result("unusable");
@@ -2018,7 +2020,11 @@ mod tls_policy_tests {
             );
             for mode in [PolicyMode::None, PolicyMode::Testing, PolicyMode::Enforce] {
                 assert_eq!(
-                    effective_tls(configured, mode, &DaneRequirement::Authenticated(vec![])),
+                    effective_tls(
+                        configured,
+                        mode,
+                        &DaneRequirement::AuthenticationRequired(vec![])
+                    ),
                     Tls::Required
                 );
                 assert_eq!(
