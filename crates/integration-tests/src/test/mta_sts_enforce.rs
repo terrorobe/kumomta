@@ -236,21 +236,30 @@ fn trusted_sink(names: &[&str]) -> anyhow::Result<(tempfile::TempDir, DaemonWith
     Ok((dir, options))
 }
 
-async fn reuse_validated_session(backend: &str, dane: bool) -> anyhow::Result<()> {
+async fn reuse_validated_session(
+    backend: &str,
+    dane: Option<&str>,
+    route_port: bool,
+) -> anyhow::Result<()> {
     // The DANE certificate deliberately fails PKIX hostname validation.
-    let name = if dane {
+    let name = if dane.is_some_and(|mode| mode != "absent") {
         "not-the-mx.example.com"
     } else {
         "mail.shared.example.com"
     };
     let (_ca, mut options) = trusted_sink(&[name])?;
     options = options.env("KUMOD_MTA_STS_TLS_BACKEND", backend);
-    if dane {
-        options = options.env("KUMOD_MTA_STS_DANE", "1");
+    if let Some(mode) = dane {
+        options = options
+            .env("KUMOD_MTA_STS_DANE", mode)
+            .env("KUMOD_MTA_STS_TLS", "Required");
+    }
+    if route_port {
+        options = options.env("KUMOD_MTA_STS_ROUTE_PORT", "1");
     }
     let mut daemon = options.start().await?;
     let mut client = daemon.smtp_client().await?;
-    let recipients = if dane {
+    let recipients = if dane.is_some() {
         ["first@enforce.example.com", "second@enforce.example.com"]
     } else {
         ["first@none.example.com", "second@enforce.example.com"]
@@ -292,7 +301,7 @@ async fn reuse_validated_session(backend: &str, dane: bool) -> anyhow::Result<()
 
 #[tokio::test]
 async fn mta_sts_reuses_pkix_validated_shared_mx() -> anyhow::Result<()> {
-    reuse_validated_session("openssl", false).await
+    reuse_validated_session("openssl", None, false).await
 }
 
 // rustls uses the system keychain on macOS rather than SSL_CERT_FILE.
@@ -300,12 +309,12 @@ async fn mta_sts_reuses_pkix_validated_shared_mx() -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn mta_sts_reuses_pkix_validated_shared_mx_rustls() -> anyhow::Result<()> {
-    reuse_validated_session("rustls", false).await
+    reuse_validated_session("rustls", None, false).await
 }
 
 #[tokio::test]
 async fn mta_sts_reuses_dane_same_domain() -> anyhow::Result<()> {
-    reuse_validated_session("openssl", true).await
+    reuse_validated_session("openssl", Some("1"), false).await
 }
 
 #[tokio::test]
@@ -598,13 +607,11 @@ async fn queued_policy_change(change: QueuedPolicyChange) -> anyhow::Result<()> 
                 && matches!(r.kind, Delivery | TransientFailure)
         })
         .context("affected result")?;
-    if site_change {
+    if delivers {
         anyhow::ensure!(
             affected_result.kind == Delivery
                 && affected_result.tls_cipher.is_some()
-                && affected_result.site == "unspecified->mail.other.example.com@smtp_client"
-                && affected_result.num_attempts == 0
-                && affected_result.meta.get("promotions") == Some(&serde_json::json!(2)),
+                && affected_result.num_attempts == 0,
             "{affected_result:?}"
         );
         let receptions = daemon.sink.collect_logs().await?;
@@ -617,39 +624,33 @@ async fn queued_policy_change(change: QueuedPolicyChange) -> anyhow::Result<()> 
                 })
                 .and_then(|r| r.session_id)
         };
-        anyhow::ensure!(
-            session_for(held).is_some() && session_for(held) == session_for(sibling),
-            "site change closed the unrelated recipients' connection"
-        );
-        anyhow::ensure!(
-            session_for(affected).is_some() && session_for(affected) != session_for(held)
-        );
-    } else if delivers {
-        anyhow::ensure!(
-            affected_result.kind == Delivery
-                && affected_result.tls_cipher.is_some()
-                && affected_result.num_attempts == 0
-                && affected_result.meta.get("promotions") == Some(&serde_json::json!(1)),
-            "{affected_result:?}"
-        );
-        let receptions = daemon.sink.collect_logs().await?;
-        let session_for = |recipient: &str| {
-            receptions
-                .iter()
-                .find(|r| {
-                    r.kind == kumo_log_types::RecordType::Reception
-                        && r.recipient.iter().any(|addr| addr == recipient)
-                })
-                .and_then(|r| r.session_id)
-        };
-        anyhow::ensure!(
-            session_for(affected).is_some() && session_for(held) != session_for(affected),
-            "unverified connection was reused for enforcing mail"
-        );
-        anyhow::ensure!(
-            session_for(affected) == session_for(sibling),
-            "verified connection was not reused for unrelated mail"
-        );
+        if site_change {
+            anyhow::ensure!(
+                affected_result.site == "unspecified->mail.other.example.com@smtp_client"
+                    && affected_result.meta.get("promotions") == Some(&serde_json::json!(2)),
+                "{affected_result:?}"
+            );
+            anyhow::ensure!(
+                session_for(held).is_some() && session_for(held) == session_for(sibling),
+                "site change closed the unrelated recipients' connection"
+            );
+            anyhow::ensure!(
+                session_for(affected).is_some() && session_for(affected) != session_for(held)
+            );
+        } else {
+            anyhow::ensure!(
+                affected_result.meta.get("promotions") == Some(&serde_json::json!(1)),
+                "{affected_result:?}"
+            );
+            anyhow::ensure!(
+                session_for(affected).is_some() && session_for(held) != session_for(affected),
+                "unverified connection was reused for enforcing mail"
+            );
+            anyhow::ensure!(
+                session_for(affected) == session_for(sibling),
+                "verified connection was not reused for unrelated mail"
+            );
+        }
     } else {
         anyhow::ensure!(
             affected_result.kind == TransientFailure
@@ -806,4 +807,229 @@ async fn mta_sts_dane_proof_is_not_pkix_proof() -> anyhow::Result<()> {
     );
     anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 1);
     Ok(())
+}
+
+#[tokio::test]
+async fn mta_sts_reuses_pkix_port_qualified_route() -> anyhow::Result<()> {
+    reuse_validated_session("openssl", None, true).await
+}
+
+#[tokio::test]
+async fn mta_sts_reuses_dane_unusable_same_domain() -> anyhow::Result<()> {
+    reuse_validated_session("openssl", Some("unusable"), false).await
+}
+
+#[tokio::test]
+async fn mta_sts_reuses_pkix_when_dane_absent() -> anyhow::Result<()> {
+    reuse_validated_session("openssl", Some("absent"), false).await
+}
+
+#[tokio::test]
+async fn mta_sts_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
+    let (_ca, options) = trusted_sink(&["mail.shared.example.com"])?;
+    let mut daemon = options
+        .env("KUMOD_MTA_STS_DANE", "mismatch")
+        .env("KUMOD_MTA_STS_NO_RETRY", "1")
+        .start()
+        .await?;
+    let mut client = daemon.smtp_client().await?;
+    // A secure creator used to make all new connections apply DANE. Per-message
+    // selection must not let a later PKIX connection bypass that requirement.
+    send(&mut client, "first@enforce.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_source_summary(
+                |s| s.get(&TransientFailure).copied().unwrap_or(0) > 0,
+                Duration::from_secs(10)
+            )
+            .await
+    );
+    send(&mut client, "middle@pkix.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await
+    );
+    send(&mut client, "last@enforce.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_source_summary(
+                |s| s.get(&TransientFailure).copied().unwrap_or(0) > 1
+                    || s.get(&Delivery).copied().unwrap_or(0) > 1,
+                Duration::from_secs(10)
+            )
+            .await
+    );
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    anyhow::ensure!(
+        records.iter().any(|r| r.kind == TransientFailure
+            && r.recipient
+                .iter()
+                .any(|addr| addr == "last@enforce.example.com")
+            && r.response.content.contains("certificate verify failed")),
+        "a PKIX session bypassed DANE: {records:?}"
+    );
+    anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 1);
+    Ok(())
+}
+
+async fn testing_then_none(tls: &str, hide_starttls: bool) -> anyhow::Result<()> {
+    let mut options = DaemonWithMaildirOptions::new()
+        .policy_file("mta-sts.lua")
+        .env("KUMOD_MTA_STS_TLS", tls)
+        .env("KUMOD_MTA_STS_NO_RETRY", "1");
+    if hide_starttls {
+        options = options.env("KUMOD_HIDE_STARTTLS", "1");
+    }
+    let mut daemon = options.start().await?;
+    let mut client = daemon.smtp_client().await?;
+    // none creates the queue with the configured floor; testing may weaken
+    // its own connection but must not weaken the next none-domain message.
+    send(&mut client, "first@none.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_source_summary(
+                |s| s.get(&TransientFailure).copied().unwrap_or(0) > 0,
+                Duration::from_secs(10)
+            )
+            .await
+    );
+    send(&mut client, "middle@testing.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await
+    );
+    send(&mut client, "last@none.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_source_summary(
+                |s| s.get(&TransientFailure).copied().unwrap_or(0) > 1
+                    || s.get(&Delivery).copied().unwrap_or(0) > 1,
+                Duration::from_secs(10)
+            )
+            .await
+    );
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    let result = records
+        .iter()
+        .find(|r| {
+            matches!(r.kind, Delivery | TransientFailure)
+                && r.recipient
+                    .iter()
+                    .any(|addr| addr == "last@none.example.com")
+        })
+        .context("missing final message result")?;
+    anyhow::ensure!(
+        result.kind == TransientFailure,
+        "testing leaked into {tls}: {result:?}"
+    );
+    anyhow::ensure!(
+        result.response.content.contains(if hide_starttls {
+            "STARTTLS is not advertised"
+        } else {
+            "TLS handshake"
+        }),
+        "{result:?}"
+    );
+    anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mta_sts_testing_preserves_none_required() -> anyhow::Result<()> {
+    testing_then_none("Required", true).await
+}
+
+#[tokio::test]
+async fn mta_sts_testing_preserves_none_required_insecure() -> anyhow::Result<()> {
+    testing_then_none("RequiredInsecure", true).await
+}
+
+#[tokio::test]
+async fn mta_sts_testing_preserves_none_opportunistic_validation() -> anyhow::Result<()> {
+    testing_then_none("Opportunistic", false).await
+}
+
+// A local policy switch does not itself reinsert the FIFO, but the replacement
+// connection still observes site-wide connection limits and failure backoff.
+async fn shared_queue_limits(limit: &str) -> anyhow::Result<()> {
+    let control = tempfile::tempdir()?;
+    let mut daemon = DaemonWithMaildirOptions::new()
+        .policy_file("mta-sts.lua")
+        .env(
+            "KUMOD_MTA_STS_CONTROL",
+            control.path().display().to_string(),
+        )
+        .env("KUMOD_MTA_STS_NO_RETRY", "1")
+        .env("KUMOD_MTA_STS_LIMIT", limit)
+        .env("KUMOD_HIDE_STARTTLS", "1")
+        .start()
+        .await?;
+    let mut client = daemon.smtp_client().await?;
+    send(&mut client, "held@none.example.com").await?;
+    wait_file(&control.path().join("entered")).await?;
+    send(&mut client, "second@enforce.example.com").await?;
+    if limit == "backoff" {
+        send(&mut client, "third@enforce.example.com").await?;
+    }
+    send(&mut client, "other@sibling.example.com").await?;
+    std::fs::write(control.path().join("release"), "")?;
+    // Rate throttling schedules a delay without logging a delivery failure.
+    // Inspect scheduled state rather than requiring a TransientFailure record.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(queue) = daemon
+                .source
+                .api_client()
+                .admin_inspect_sched_q_v1(&kumo_api_types::InspectQueueV1Request {
+                    queue_name: "sibling.example.com".into(),
+                    want_body: false,
+                    limit: Some(0),
+                })
+                .await
+            {
+                if queue.num_scheduled == 1 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("shared {limit} was not applied"))?;
+    std::fs::write(control.path().join("stop"), "")?;
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    let other = records.iter().find(|r| {
+        r.kind == TransientFailure
+            && r.recipient
+                .iter()
+                .any(|addr| addr == "other@sibling.example.com")
+    });
+    if limit == "backoff" {
+        anyhow::ensure!(
+            other.is_some_and(|r| r.response.content.contains("bulk delay of ready queue")),
+            "{other:?}"
+        );
+    } else {
+        anyhow::ensure!(
+            other.is_none(),
+            "rate limiting must not count as a delivery failure: {other:?}"
+        );
+    }
+    anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mta_sts_policy_reconnect_observes_shared_connection_rate() -> anyhow::Result<()> {
+    shared_queue_limits("rate").await
+}
+
+#[tokio::test]
+async fn mta_sts_policy_failures_observe_shared_backoff() -> anyhow::Result<()> {
+    shared_queue_limits("backoff").await
 }

@@ -47,5 +47,21 @@ with `enable_tls="OpportunisticInsecure"`.
 If the `mode` is set to `"none"`, then your configured value for `enable_tls`
 will be used.
 
-If `enable_dane=true` and `TLSA` records are present, then any MTA-STS policy
-will be ignored.
+If `enable_dane=true` and usable `TLSA` records are present, DANE authentication
+supersedes the MTA-STS TLS posture. Unusable TLSA records still require STARTTLS;
+MTA-STS may add certificate validation but cannot relax that requirement. The MX
+host filtering performed during resolution is independent of this TLS precedence.
+
+The dispatcher applies the routing domain's effective TLS requirement to each
+message, including when domains share an MX ready queue. It reuses a connection
+only when that connection satisfies the requirement. DANE decisions are reused
+only within the same unexpired domain/MX context; a change requires a fresh
+connection-time evaluation.
+
+A policy-driven reconnect does not itself reinsert other ready messages, but it
+still observes the site's shared connection-rate limits and failure backoff.
+Refreshing an expired MX/policy result can wait for DNS and HTTPS requests in the
+dispatcher, delaying other messages when dispatch capacity is limited. Errors
+returned by MX resolution defer the affected message. If MTA-STS retrieval fails
+without a usable cached policy, the resolver proceeds without an MTA-STS override;
+the configured TLS setting and any applicable DANE requirement still apply.

@@ -180,6 +180,37 @@ impl MxListEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaneRequirement {
+    NotApplicable,
+    Authenticated,
+    EncryptionRequired,
+}
+
+/// DANE policy context for the current connection, including absent or
+/// unusable TLSA records. Reuse requires the same unexpired MX snapshot;
+/// otherwise DANE must be evaluated again, regardless of PKIX validation.
+#[derive(Debug)]
+struct DaneConnectionContext {
+    mx: Arc<MailExchanger>,
+    requirement: DaneRequirement,
+}
+
+/// Apply the same precedence for new connections and connection reuse.
+fn effective_tls(configured: Tls, mta_sts: PolicyMode, dane: DaneRequirement) -> Tls {
+    match (dane, mta_sts) {
+        (DaneRequirement::Authenticated, _) | (_, PolicyMode::Enforce) => Tls::Required,
+        (DaneRequirement::EncryptionRequired, _) => Tls::RequiredInsecure,
+        (DaneRequirement::NotApplicable, PolicyMode::Testing) => Tls::OpportunisticInsecure,
+        (DaneRequirement::NotApplicable, PolicyMode::None) => configured,
+    }
+}
+
+fn same_dns_name(a: &str, b: &str) -> bool {
+    a.trim_end_matches('.')
+        .eq_ignore_ascii_case(b.trim_end_matches('.'))
+}
+
 #[derive(Debug)]
 pub struct SmtpDispatcher {
     addresses: Vec<ResolvedAddress>,
@@ -190,12 +221,14 @@ pub struct SmtpDispatcher {
     tls_info: Option<TlsInformation>,
     /// MX hostname whose certificate was validated by PKIX on this session.
     pkix_verified_mx: Option<String>,
-    /// DANE proof is reusable only for the same unexpired MX/policy snapshot.
-    /// It is not PKIX proof, nor evidence for another recipient domain.
-    dane_verified_mx: Option<Arc<MailExchanger>>,
+    dane_context: Option<DaneConnectionContext>,
+    /// Capabilities advertised before STARTTLS on the connected session.
+    peer_has_starttls: bool,
     /// Per-domain MX/policy snapshot for the most recent message, not the
     /// potentially long-lived snapshot on the shared ready queue.
     message_mx: Option<Arc<MailExchanger>>,
+    /// MailExchanger::domain_name omits an explicit routing port.
+    message_mx_port: Option<u16>,
     tracer: Arc<SmtpClientTracerImpl>,
     site_has_broken_tls: bool,
     terminated_ok: bool,
@@ -359,8 +392,10 @@ impl SmtpDispatcher {
             ehlo_name,
             tls_info: None,
             pkix_verified_mx: None,
-            dane_verified_mx: None,
+            dane_context: None,
+            peer_has_starttls: false,
             message_mx: dispatcher.mx.clone(),
+            message_mx_port: None,
             source_address: None,
             tracer,
             site_has_broken_tls: false,
@@ -369,6 +404,15 @@ impl SmtpDispatcher {
             treat_mx_list_as_secure: proto_config.treat_mx_list_as_secure,
             recips_last_txn: HashMap::new(),
         }))
+    }
+
+    /// Clear authentication and capabilities for an explicit close or a new
+    /// connection. Reconnect-plan updates retain them for disposition logging.
+    fn reset_connection_security(&mut self) {
+        self.tls_info.take();
+        self.pkix_verified_mx.take();
+        self.dane_context.take();
+        self.peer_has_starttls = false;
     }
 
     async fn mx_for_message(
@@ -386,11 +430,13 @@ impl SmtpDispatcher {
         let name = msg.get_queue_name().await?;
         let components = QueueNameComponents::parse(&name);
         let domain = components.routing_domain.unwrap_or(components.domain);
+        let (domain_name, port) = match has_colon_port(domain) {
+            Some((name, port)) => (name, Some(port)),
+            None => (domain, None),
+        };
         if let Some(mx) = &self.message_mx {
-            if mx
-                .domain_name
-                .trim_end_matches('.')
-                .eq_ignore_ascii_case(domain.trim_end_matches('.'))
+            if same_dns_name(&mx.domain_name, domain_name)
+                && self.message_mx_port == port
                 && !mx.has_expired()
             {
                 return Ok(Some(mx.clone()));
@@ -398,7 +444,63 @@ impl SmtpDispatcher {
         }
         let mx = MailExchanger::resolve(domain).await?;
         self.message_mx.replace(mx.clone());
+        self.message_mx_port = port;
         Ok(Some(mx))
+    }
+
+    fn connection_satisfies_message(
+        &self,
+        mx: &Arc<MailExchanger>,
+        path_config: &EgressPathConfig,
+        site: &str,
+    ) -> bool {
+        let dane = if path_config.enable_dane && mx.is_secure {
+            // NotApplicable records an evaluated DANE decision. A missing or
+            // stale context cannot establish that PKIX alone is sufficient.
+            match &self.dane_context {
+                Some(context) if Arc::ptr_eq(&context.mx, mx) && !mx.has_expired() => {
+                    context.requirement
+                }
+                // Reconnect to evaluate DANE for this message's domain before
+                // allowing a PKIX-authenticated or unverified session to serve it.
+                _ => return false,
+            }
+        } else {
+            DaneRequirement::NotApplicable
+        };
+        let mode = if path_config.enable_mta_sts {
+            mx.mta_sts
+        } else {
+            PolicyMode::None
+        };
+        let tls = effective_tls(path_config.enable_tls, mode, dane);
+        // Resolved MX entries include explicit routing ports; certificate
+        // hostnames do not. Compare them separately without losing the port.
+        let pkix_valid = || {
+            self.pkix_verified_mx.as_ref().is_some_and(|host| {
+                mx.hosts.iter().any(|allowed| {
+                    let (allowed_host, allowed_port) = match has_colon_port(allowed) {
+                        Some((name, port)) => (name, Some(port)),
+                        None => (allowed.as_str(), None),
+                    };
+                    same_dns_name(allowed_host, host)
+                        && allowed_port == self.client_address.as_ref().and_then(|a| a.addr.port())
+                })
+            })
+        };
+        match tls {
+            Tls::Required if dane == DaneRequirement::Authenticated => self
+                .tls_info
+                .as_ref()
+                .is_some_and(|info| info.authenticated),
+            Tls::Required => pkix_valid(),
+            Tls::RequiredInsecure => self.tls_info.is_some(),
+            // Opportunistic TLS still requires certificate validation when
+            // encrypted. Plaintext reuse requires absent or remembered-broken TLS.
+            Tls::Opportunistic if self.tls_info.is_some() => pkix_valid(),
+            Tls::Opportunistic => !self.peer_has_starttls || self.has_broken_tls(site),
+            Tls::OpportunisticInsecure | Tls::Disabled => true,
+        }
     }
 
     async fn attempt_connection_impl(
@@ -409,9 +511,11 @@ impl SmtpDispatcher {
         let message_mx = match self.mx_for_message(dispatcher).await {
             Ok(mx) => mx,
             Err(err) => {
+                // Resolution errors do not consume connection candidates.
+                // Returning Err would retry a cached failure without advancing.
                 return Ok(AttemptConnectionDisposition::MessageDeferred(format!(
                     "failed to resolve message MX/policy: {err:#}"
-                )))
+                )));
             }
         };
         if let (Some(mx), Some(site_mx)) = (&message_mx, &dispatcher.mx) {
@@ -437,20 +541,15 @@ impl SmtpDispatcher {
             }
         }
         if let Some(mx) = &message_mx {
-            if mx.mta_sts == PolicyMode::Enforce
-                && self
-                    .client
-                    .as_ref()
-                    .is_some_and(|client| client.is_connected())
-                && !self.pkix_verified_mx.as_ref().is_some_and(|host| {
-                    mx.hosts
-                        .iter()
-                        .any(|allowed| allowed.eq_ignore_ascii_case(host))
-                })
-                && !(dispatcher.path_config.borrow().enable_dane
-                    && self.dane_verified_mx.as_ref().is_some_and(|verified| {
-                        Arc::ptr_eq(verified, mx) && !verified.has_expired()
-                    }))
+            if self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_connected())
+                && !self.connection_satisfies_message(
+                    mx,
+                    &dispatcher.path_config.borrow(),
+                    &dispatcher.name,
+                )
             {
                 // A local policy change is not a peer failure. Keep the message
                 // and remaining candidates here, retrying the connected host
@@ -614,7 +713,6 @@ impl SmtpDispatcher {
 
         let ehlo_name = self.ehlo_name.to_string();
         let mx_host = address.name.to_string();
-        let mut enable_tls = path_config.enable_tls;
         let port = dispatcher
             .egress_source
             .remote_port
@@ -711,9 +809,7 @@ impl SmtpDispatcher {
         };
 
         self.source_address.take();
-        self.tls_info.take();
-        self.pkix_verified_mx.take();
-        self.dane_verified_mx.take();
+        self.reset_connection_security();
         dispatcher.set_detail("connect+banner");
         let (mut client, source_address) = tokio::select! {
             _ = shutdown.shutting_down() => {
@@ -737,12 +833,7 @@ impl SmtpDispatcher {
         let broken_tls = self.has_broken_tls(&dispatcher.name);
 
         let mut dane_tlsa = vec![];
-        let mut mta_sts_eligible = true;
-        // Set when DANE published TLSA records that turned out to be unusable:
-        // STARTTLS is then mandatory (the host committed to TLS) even though we
-        // cannot authenticate it, so MTA-STS may add authentication but must not
-        // relax the requirement back to opportunistic.
-        let mut dane_requires_starttls = false;
+        let mut dane_requirement = DaneRequirement::NotApplicable;
 
         let mut certificate_from_pem = None;
         let mut private_key_from_pem = None;
@@ -824,9 +915,7 @@ impl SmtpDispatcher {
                         self.tracer.diagnostic(Level::INFO, || {
                             format!("DANE records for {} are: {dane_tlsa:?}", address.name)
                         });
-                        enable_tls = Tls::Required;
-                        // Do not use MTA-STS when we have usable DANE records
-                        mta_sts_eligible = false;
+                        dane_requirement = DaneRequirement::Authenticated;
                     }
                     DaneStatus::Unusable => {
                         record_dane_result("unusable");
@@ -843,8 +932,7 @@ impl SmtpDispatcher {
                                 address.name
                             )
                         });
-                        enable_tls = Tls::RequiredInsecure;
-                        dane_requires_starttls = true;
+                        dane_requirement = DaneRequirement::EncryptionRequired;
                     }
                     DaneStatus::TempFail(reason) => {
                         record_dane_result("tempfail");
@@ -882,41 +970,26 @@ impl SmtpDispatcher {
                 .diagnostic(Level::INFO, || format!("DANE is not enabled for this path"));
         }
 
-        // Apply the TLS posture from any MTA-STS policy that was resolved
-        // during MX resolution. Host gating is already structural: resolution
-        // pruned disallowed hosts and isolated impossible domains, so the
-        // pinned mx's policy is always satisfiable by the candidate hosts.
-        // We consult it here only for TLS posture, and only when this egress
-        // path opts in via enable_mta_sts. The `mta_sts_eligible` guard
-        // preserves DANE precedence (DANE clears it when TLSA is present).
-        if mta_sts_eligible && path_config.enable_mta_sts {
-            match message_mx.as_ref().map(|mx| mx.mta_sts) {
-                Some(PolicyMode::Enforce) => {
-                    enable_tls = Tls::Required;
-                    self.tracer.diagnostic(Level::INFO, || {
-                        "MTA-STS enforce policy in effect; requiring TLS".to_string()
-                    });
-                }
-                Some(PolicyMode::Testing) => {
-                    // Don't relax a mandatory STARTTLS established by
-                    // unusable DANE TLSA records.
-                    if !dane_requires_starttls {
-                        enable_tls = Tls::OpportunisticInsecure;
-                    }
-                    self.tracer.diagnostic(Level::INFO, || {
-                        "MTA-STS testing policy in effect".to_string()
-                    });
-                }
-                None | Some(PolicyMode::None) => {}
-            }
+        let mta_sts = if path_config.enable_mta_sts {
+            message_mx
+                .as_ref()
+                .map_or(PolicyMode::None, |mx| mx.mta_sts)
+        } else {
+            PolicyMode::None
+        };
+        let enable_tls = effective_tls(path_config.enable_tls, mta_sts, dane_requirement);
+        if dane_requirement != DaneRequirement::Authenticated && mta_sts != PolicyMode::None {
+            self.tracer.diagnostic(Level::INFO, || {
+                format!("MTA-STS {mta_sts:?} policy in effect; TLS posture is {enable_tls:?}")
+            });
         }
-
-        let dane_verification = !dane_tlsa.is_empty();
-        let pkix_verification = !enable_tls.allow_insecure() && !dane_verification;
+        let pkix_verification =
+            !enable_tls.allow_insecure() && dane_requirement != DaneRequirement::Authenticated;
         let prefer_openssl = path_config.tls_prefer_openssl;
 
         // A couple of little helper types to make the match statement below
         // a bit easier to grok at a glance
+        #[derive(Clone, Copy)]
         enum AdvTls {
             Yes,
             No,
@@ -1107,16 +1180,13 @@ impl SmtpDispatcher {
         };
 
         if tls_enabled
+            && pkix_verification
             && self
                 .tls_info
                 .as_ref()
                 .is_some_and(|info| info.authenticated)
         {
-            if pkix_verification {
-                self.pkix_verified_mx.replace(address.name.to_string());
-            } else if dane_verification {
-                self.dane_verified_mx = message_mx;
-            }
+            self.pkix_verified_mx.replace(address.name.to_string());
         }
 
         if let Some(username) = &path_config.smtp_auth_plain_username {
@@ -1167,6 +1237,15 @@ impl SmtpDispatcher {
                 })?;
         }
 
+        self.peer_has_starttls = matches!(has_tls, AdvTls::Yes);
+        self.dane_context = if path_config.enable_dane {
+            message_mx.map(|mx| DaneConnectionContext {
+                mx,
+                requirement: dane_requirement,
+            })
+        } else {
+            None
+        };
         self.client
             .replace(connection_wrapper.map_connection(client));
         self.client_address.replace(address);
@@ -1281,9 +1360,7 @@ impl SmtpDispatcher {
 #[async_trait]
 impl QueueDispatcher for SmtpDispatcher {
     async fn close_connection(&mut self, _dispatcher: &mut Dispatcher) -> anyhow::Result<bool> {
-        self.pkix_verified_mx.take();
-        self.dane_verified_mx.take();
-        self.tls_info.take();
+        self.reset_connection_security();
         if let Some(mut client) = self.client.take() {
             client
                 .send_command(&rfc5321::parser::Command::Quit)
@@ -1817,4 +1894,61 @@ async fn classify_record(response: &Response) -> (RecordType, IsTooManyRecipient
     };
 
     (record_type, too_many)
+}
+
+#[cfg(test)]
+mod tls_policy_tests {
+    use super::*;
+
+    #[test]
+    fn effective_tls_precedence() {
+        for configured in [
+            Tls::Disabled,
+            Tls::Opportunistic,
+            Tls::OpportunisticInsecure,
+            Tls::Required,
+            Tls::RequiredInsecure,
+        ] {
+            assert_eq!(
+                effective_tls(configured, PolicyMode::None, DaneRequirement::NotApplicable),
+                configured
+            );
+            assert_eq!(
+                effective_tls(
+                    configured,
+                    PolicyMode::Testing,
+                    DaneRequirement::NotApplicable
+                ),
+                Tls::OpportunisticInsecure
+            );
+            assert_eq!(
+                effective_tls(
+                    configured,
+                    PolicyMode::Enforce,
+                    DaneRequirement::NotApplicable
+                ),
+                Tls::Required
+            );
+            for mode in [PolicyMode::None, PolicyMode::Testing, PolicyMode::Enforce] {
+                assert_eq!(
+                    effective_tls(configured, mode, DaneRequirement::Authenticated),
+                    Tls::Required
+                );
+                assert_eq!(
+                    effective_tls(configured, mode, DaneRequirement::EncryptionRequired),
+                    if mode == PolicyMode::Enforce {
+                        Tls::Required
+                    } else {
+                        Tls::RequiredInsecure
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dns_name_comparison() {
+        assert!(same_dns_name("MAIL.Example.com.", "mail.example.com"));
+        assert!(!same_dns_name("mail.example.com", "other.example.com"));
+    }
 }

@@ -2196,41 +2196,14 @@ impl Dispatcher {
             dispatcher.enter_phase(DispatcherPhase::DeliveringMessage);
             if let Err(err) = dispatcher.deliver_message(&mut *queue_dispatcher).await {
                 tracing::debug!("deliver_message: {err:#}");
-                for msg in dispatcher.msgs.drain(..) {
-                    let response = Response {
+                dispatcher
+                    .defer_messages(Response {
                         code: 400,
                         enhanced_code: None,
                         content: format!("KumoMTA internal: error in deliver_message: {err:#}"),
                         command: None,
-                    };
-
-                    log_disposition(LogDisposition {
-                        kind: RecordType::TransientFailure,
-                        msg: msg.clone(),
-                        site: &dispatcher.name,
-                        peer_address: None,
-                        response: response.clone(),
-                        egress_pool: Some(&dispatcher.egress_pool),
-                        egress_source: Some(&dispatcher.egress_source.name),
-                        relay_disposition: None,
-                        delivery_protocol: Some(&dispatcher.delivery_protocol),
-                        tls_info: None,
-                        source_address: None,
-                        provider: dispatcher.path_config.borrow().provider_name.as_deref(),
-                        session_id: Some(dispatcher.session_id),
-                        recipient_list: None,
                     })
-                    .await;
-                    QueueManager::requeue_message(
-                        msg,
-                        IncrementAttempts::Yes,
-                        None,
-                        response,
-                        InsertReason::LoggedTransientFailure.into(),
-                    )
                     .await?;
-                    dispatcher.metrics.inc_transfail();
-                }
             }
         }
     }

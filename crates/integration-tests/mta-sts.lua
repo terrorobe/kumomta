@@ -20,6 +20,10 @@ max_age: 86400]],
 mode: enforce
 mx: mail.shared.example.com
 max_age: 86400]],
+  ['testing.example.com'] = [[version: STSv1
+mode: testing
+mx: mail.shared.example.com
+max_age: 86400]],
   ['pkix.example.com'] = [[version: STSv1
 mode: enforce
 mx: mail.shared.example.com
@@ -107,6 +111,10 @@ $ORIGIN none.example.com.
 @    600 MX 10 mail.shared.example.com.
 ]],
     [[
+$ORIGIN testing.example.com.
+@ 600 MX 10 mail.shared.example.com.
+]],
+    [[
 $ORIGIN sibling.example.com.
 @ 600 MX 10 mail.shared.example.com.
 ]],
@@ -144,6 +152,16 @@ mail 600 A 127.0.0.1
         :gsub('%-%-%-%-%-END CERTIFICATE%-%-%-%-%-', '')
         :gsub('%s', '')
     )
+    local tlsa = '3 0 0 ' .. kumo.encode.hex_encode(der)
+    if os.getenv 'KUMOD_MTA_STS_DANE' == 'mismatch' then
+      tlsa = '3 0 1 ' .. string.rep('00', 32)
+    elseif os.getenv 'KUMOD_MTA_STS_DANE' == 'unusable' then
+      tlsa = '1 0 0 ' .. kumo.encode.hex_encode(der)
+      sts_policies['enforce.example.com'] =
+        'version: STSv1\nmode: none\nmax_age: 86400'
+    elseif os.getenv 'KUMOD_MTA_STS_DANE' == 'absent' then
+      tlsa = nil
+    end
     kumo.dns.configure_test_resolver {
       zones = {
         {
@@ -155,11 +173,12 @@ mail 600 A 127.0.0.1
           secure = false,
         },
         {
-          zone = '$ORIGIN shared.example.com.\nmail 600 A 127.0.0.1\n_'
-            .. SINK_PORT
-            .. '._tcp.mail 600 TLSA 3 0 0 '
-            .. kumo.encode.hex_encode(der)
-            .. '\n',
+          zone = '$ORIGIN shared.example.com.\nmail 600 A 127.0.0.1\n'
+            .. (
+              tlsa
+                and ('_' .. SINK_PORT .. '._tcp.mail 600 TLSA ' .. tlsa .. '\n')
+              or ''
+            ),
           secure = true,
         },
       },
@@ -177,11 +196,12 @@ kumo.on('get_queue_config', function(domain)
   -- to the sink, so MTA-STS is evaluated before ready-queue rollup.
   return kumo.make_queue_config {
     protocol = nil,
-    retry_interval = '2s',
+    retry_interval = os.getenv 'KUMOD_MTA_STS_NO_RETRY' and '1h' or '2s',
   }
 end)
 
 kumo.on('get_egress_path_config', function(domain, _source_name, site_name)
+  domain = domain:gsub(':%d+$', '')
   if
     domain == 'transition.example.com'
     and os.getenv 'KUMOD_TRANSITION_STS'
@@ -204,15 +224,25 @@ max_age: 86400]]
   local shared = domain == 'none.example.com'
     or domain == 'enforce.example.com'
     or domain == 'pkix.example.com'
+    or domain == 'testing.example.com'
     or domain == 'transition.example.com'
     or domain == 'sibling.example.com'
     or domain == 'unchanged.example.com'
   local untrusted_tls = os.getenv 'KUMOD_UNTRUSTED_MTA_STS_TLS' == '1'
   return kumo.make_egress_path {
-    enable_tls = shared and not untrusted_tls and 'Opportunistic'
-      or 'OpportunisticInsecure',
+    enable_tls = os.getenv 'KUMOD_MTA_STS_TLS'
+      or (
+        shared and not untrusted_tls and 'Opportunistic'
+        or 'OpportunisticInsecure'
+      ),
     prohibited_hosts = {},
     connection_limit = 1,
+    consecutive_connection_failures_before_delay = os.getenv 'KUMOD_MTA_STS_LIMIT'
+          == 'backoff'
+        and 0
+      or nil,
+    max_connection_rate = os.getenv 'KUMOD_MTA_STS_LIMIT' == 'rate' and '1/h'
+      or nil,
     -- Direct the resolved 127.0.0.1 MX host at the sink.
     smtp_port = SINK_PORT,
     -- Keep the existing MX-filtering tests focused on resolution. The shared
@@ -225,6 +255,12 @@ max_age: 86400]]
     aggressive_connection_opening = shared
       and os.getenv 'KUMOD_AGGRESSIVE_MTA_STS' == '1',
   }
+end)
+
+kumo.on('smtp_server_message_received', function(msg)
+  if os.getenv 'KUMOD_MTA_STS_ROUTE_PORT' then
+    msg:set_meta('routing_domain', msg:recipient().domain .. ':' .. SINK_PORT)
+  end
 end)
 
 -- Count promotions so queue-continuity tests detect bulk re-insertion, not
