@@ -1328,15 +1328,7 @@ impl SmtpServerSession {
 
                 let data = unstuff(tail);
 
-                let split_bare_line_endings = matches!(
-                    self.params.invalid_line_endings,
-                    ConformanceDisposition::Allow | ConformanceDisposition::Fix
-                );
-                if !check_line_lengths(
-                    &data,
-                    self.params.line_length_hard_limit,
-                    split_bare_line_endings,
-                ) {
+                if !check_line_lengths(&data, self.params.line_length_hard_limit) {
                     SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
                         conn_meta: self.meta.clone_inner(),
                         payload: SmtpServerTraceEventPayload::Diagnostic {
@@ -2865,7 +2857,7 @@ impl SmtpServerSession {
                         when: Utc::now(),
                     });
 
-                    data = mailparsing::normalize_crlf(&data);
+                    mailparsing::normalize_crlf_in_place(&mut data);
                 }
             }
         }
@@ -3497,31 +3489,13 @@ fn unstuff(data: Vec<u8>) -> Vec<u8> {
     data
 }
 
-/// Check that every line in `data` is within `limit` bytes, excluding the line
-/// terminator.
-///
-/// When `split_bare_line_endings` is false, only CRLF terminates a line. When
-/// true, a bare CR or LF also terminates a line. Without that, a message using
-/// bare LF between lines looks like one oversized line to the CRLF-only scan.
-fn check_line_lengths(data: &[u8], limit: usize, split_bare_line_endings: bool) -> bool {
+fn check_line_lengths(data: &[u8], limit: usize) -> bool {
     let mut last_index = 0;
-    if split_bare_line_endings {
-        // A CRLF yields a zero-length segment between the CR and the LF, which
-        // is within any limit, so treating each byte as a terminator measures
-        // CRLF, bare CR, and bare LF lines alike.
-        for idx in memchr::memchr2_iter(b'\r', b'\n', data) {
-            if idx - last_index > limit {
-                return false;
-            }
-            last_index = idx + 1;
+    for idx in CRLF.find_iter(data) {
+        if idx - last_index > limit {
+            return false;
         }
-    } else {
-        for idx in CRLF.find_iter(data) {
-            if idx - last_index > limit {
-                return false;
-            }
-            last_index = idx + 2 /* CRLF */;
-        }
+        last_index = idx + 2 /* CRLF */;
     }
     data.len() - last_index <= limit
 }
@@ -3735,37 +3709,18 @@ mod test {
 
     #[test]
     fn line_lengths() {
-        assert!(check_line_lengths(b"hello", 78, false));
-        assert!(check_line_lengths(b"hello", 5, false));
-        assert!(!check_line_lengths(b"hello", 4, false));
+        assert!(check_line_lengths(b"hello", 78));
+        assert!(check_line_lengths(b"hello", 5));
+        assert!(!check_line_lengths(b"hello", 4));
 
         assert!(check_line_lengths(
             b"hello there\r\nanother line over there\r\n",
-            78,
-            false
+            78
         ));
         assert!(!check_line_lengths(
             b"hello there\r\nanother line over there\r\n",
-            12,
-            false
+            12
         ));
-        assert!(check_line_lengths(
-            b"hello there\r\nhello there\r\n",
-            12,
-            false
-        ));
-
-        // With the CRLF-only scan, bare-LF lines read as one long line and are
-        // rejected. Splitting on bare line endings measures them per line.
-        assert!(!check_line_lengths(
-            b"hello there\nhello there\n",
-            12,
-            false
-        ));
-        assert!(check_line_lengths(b"hello there\nhello there\n", 12, true));
-        // A truly long line is still rejected in both modes.
-        assert!(!check_line_lengths(b"hello there\nhello there\n", 4, true));
-        // Bare CR is a line terminator when splitting.
-        assert!(check_line_lengths(b"hello there\rhello there\r", 12, true));
+        assert!(check_line_lengths(b"hello there\r\nhello there\r\n", 12));
     }
 }

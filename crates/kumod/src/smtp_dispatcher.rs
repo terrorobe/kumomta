@@ -20,7 +20,7 @@ use kumo_log_types::{MaybeProxiedSourceAddress, ResolvedAddress};
 use kumo_prometheus::declare_metric;
 use kumo_server_lifecycle::{ShutdownSubcription, ShuttingDownError};
 use kumo_server_runtime::spawn;
-use mailexchanger::{PolicyMode, ResolvedMxAddresses};
+use mailexchanger::{MailExchanger, PolicyMode, ResolvedMxAddresses};
 use message::message::QueueNameComponents;
 use message::Message;
 use rfc5321::parser::{EnvelopeAddress, ForwardPath, ReversePath};
@@ -188,6 +188,14 @@ pub struct SmtpDispatcher {
     source_address: Option<MaybeProxiedSourceAddress>,
     ehlo_name: String,
     tls_info: Option<TlsInformation>,
+    /// MX hostname whose certificate was validated by PKIX on this session.
+    pkix_verified_mx: Option<String>,
+    /// DANE proof is reusable only for the same unexpired MX/policy snapshot.
+    /// It is not PKIX proof, nor evidence for another recipient domain.
+    dane_verified_mx: Option<Arc<MailExchanger>>,
+    /// Per-domain MX/policy snapshot for the most recent message, not the
+    /// potentially long-lived snapshot on the shared ready queue.
+    message_mx: Option<Arc<MailExchanger>>,
     tracer: Arc<SmtpClientTracerImpl>,
     site_has_broken_tls: bool,
     terminated_ok: bool,
@@ -350,6 +358,9 @@ impl SmtpDispatcher {
             client_address: None,
             ehlo_name,
             tls_info: None,
+            pkix_verified_mx: None,
+            dane_verified_mx: None,
+            message_mx: dispatcher.mx.clone(),
             source_address: None,
             tracer,
             site_has_broken_tls: false,
@@ -360,10 +371,100 @@ impl SmtpDispatcher {
         }))
     }
 
+    async fn mx_for_message(
+        &mut self,
+        dispatcher: &Dispatcher,
+    ) -> anyhow::Result<Option<Arc<MailExchanger>>> {
+        // Explicit mx_list routes never use a DNS MX or its MTA-STS policy.
+        if !dispatcher.path_config.borrow().enable_mta_sts || dispatcher.mx.is_none() {
+            return Ok(None);
+        }
+        let Some(msg) = dispatcher.msgs.first() else {
+            // Aggressive connection opening can run before taking a message.
+            return Ok(None);
+        };
+        let name = msg.get_queue_name().await?;
+        let components = QueueNameComponents::parse(&name);
+        let domain = components.routing_domain.unwrap_or(components.domain);
+        if let Some(mx) = &self.message_mx {
+            if mx
+                .domain_name
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(domain.trim_end_matches('.'))
+                && !mx.has_expired()
+            {
+                return Ok(Some(mx.clone()));
+            }
+        }
+        let mx = MailExchanger::resolve(domain).await?;
+        self.message_mx.replace(mx.clone());
+        Ok(Some(mx))
+    }
+
     async fn attempt_connection_impl(
         &mut self,
         dispatcher: &mut Dispatcher,
     ) -> anyhow::Result<AttemptConnectionDisposition> {
+        // MX-site queues may contain messages for many recipient domains.
+        let message_mx = match self.mx_for_message(dispatcher).await {
+            Ok(mx) => mx,
+            Err(err) => {
+                return Ok(AttemptConnectionDisposition::MessageDeferred(format!(
+                    "failed to resolve message MX/policy: {err:#}"
+                )))
+            }
+        };
+        if let (Some(mx), Some(site_mx)) = (&message_mx, &dispatcher.mx) {
+            if mx.site_name != site_mx.site_name {
+                // MX or MTA-STS policy changed while this message was ready.
+                // Re-promote just this message to its new site, not the whole
+                // provider queue; retain it until insertion succeeds, so an
+                // error can defer it and cancellation cannot lose it.
+                if let Some(msg) = dispatcher.msgs.first() {
+                    if let Err(err) = Dispatcher::reinsert_message(
+                        msg.clone(),
+                        InsertReason::MxSiteChanged.into(),
+                    )
+                    .await
+                    {
+                        return Ok(AttemptConnectionDisposition::MessageDeferred(format!(
+                            "failed to reinsert message after MX site change: {err:#}"
+                        )));
+                    }
+                    dispatcher.msgs.clear();
+                }
+                return Ok(AttemptConnectionDisposition::MessageReinserted);
+            }
+        }
+        if let Some(mx) = &message_mx {
+            if mx.mta_sts == PolicyMode::Enforce
+                && self
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| client.is_connected())
+                && !self.pkix_verified_mx.as_ref().is_some_and(|host| {
+                    mx.hosts
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(host))
+                })
+                && !(dispatcher.path_config.borrow().enable_dane
+                    && self.dane_verified_mx.as_ref().is_some_and(|verified| {
+                        Arc::ptr_eq(verified, mx) && !verified.has_expired()
+                    }))
+            {
+                // A local policy change is not a peer failure. Keep the message
+                // and remaining candidates here, retrying the connected host
+                // with the required authentication before MAIL FROM. Do not
+                // drain or re-select sources for the rest of the ready queue.
+                self.tracer.diagnostic(Level::INFO, || {
+                    "Reconnecting for message TLS policy".to_string()
+                });
+                self.close_connection(dispatcher).await?;
+                if let Some(address) = self.client_address.take() {
+                    self.addresses.push(address);
+                }
+            }
+        }
         if let Some(client) = &mut self.client {
             if client.is_connected() {
                 // If we get a unilateral response here now it can either be:
@@ -610,6 +711,9 @@ impl SmtpDispatcher {
         };
 
         self.source_address.take();
+        self.tls_info.take();
+        self.pkix_verified_mx.take();
+        self.dane_verified_mx.take();
         dispatcher.set_detail("connect+banner");
         let (mut client, source_address) = tokio::select! {
             _ = shutdown.shutting_down() => {
@@ -665,7 +769,7 @@ impl SmtpDispatcher {
             // the host's address records to have been securely (DNSSEC)
             // resolved; the TLSA records are queried against the MX host
             // (RFC 7672 section 3.2.2), not the envelope/routing domain.
-            let mx_selection_secure = match &dispatcher.mx {
+            let mx_selection_secure = match message_mx.as_ref().or(dispatcher.mx.as_ref()) {
                 Some(mx) => mx.is_secure,
                 // No DNS MX RRset: a locally-configured mx_list, trusted only
                 // when the operator opted in via treat_mx_list_as_secure.
@@ -786,7 +890,7 @@ impl SmtpDispatcher {
         // path opts in via enable_mta_sts. The `mta_sts_eligible` guard
         // preserves DANE precedence (DANE clears it when TLSA is present).
         if mta_sts_eligible && path_config.enable_mta_sts {
-            match dispatcher.mx.as_ref().map(|mx| mx.mta_sts) {
+            match message_mx.as_ref().map(|mx| mx.mta_sts) {
                 Some(PolicyMode::Enforce) => {
                     enable_tls = Tls::Required;
                     self.tracer.diagnostic(Level::INFO, || {
@@ -807,6 +911,8 @@ impl SmtpDispatcher {
             }
         }
 
+        let dane_verification = !dane_tlsa.is_empty();
+        let pkix_verification = !enable_tls.allow_insecure() && !dane_verification;
         let prefer_openssl = path_config.tls_prefer_openssl;
 
         // A couple of little helper types to make the match statement below
@@ -1000,6 +1106,19 @@ impl SmtpDispatcher {
             }
         };
 
+        if tls_enabled
+            && self
+                .tls_info
+                .as_ref()
+                .is_some_and(|info| info.authenticated)
+        {
+            if pkix_verification {
+                self.pkix_verified_mx.replace(address.name.to_string());
+            } else if dane_verification {
+                self.dane_verified_mx = message_mx;
+            }
+        }
+
         if let Some(username) = &path_config.smtp_auth_plain_username {
             if !tls_enabled {
                 if !path_config.allow_smtp_auth_plain_without_tls {
@@ -1162,6 +1281,9 @@ impl SmtpDispatcher {
 #[async_trait]
 impl QueueDispatcher for SmtpDispatcher {
     async fn close_connection(&mut self, _dispatcher: &mut Dispatcher) -> anyhow::Result<bool> {
+        self.pkix_verified_mx.take();
+        self.dane_verified_mx.take();
+        self.tls_info.take();
         if let Some(mut client) = self.client.take() {
             client
                 .send_command(&rfc5321::parser::Command::Quit)

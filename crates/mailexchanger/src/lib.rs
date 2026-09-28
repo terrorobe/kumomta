@@ -399,13 +399,9 @@ async fn apply_mta_sts(
         }
     };
 
-    // Refresh in full: re-resolve when either the MX records or the policy
-    // expire. max_age is clamped on parse, but guard the addition anyway so an
-    // overflowing value expires immediately rather than panicking.
-    let policy_expires = Instant::now()
-        .checked_add(Duration::from_secs(policy.max_age))
-        .unwrap_or_else(Instant::now);
-    *expires = (*expires).min(policy_expires);
+    // Refresh holistically: re-resolve when either the MX records or the
+    // policy expire.
+    *expires = (*expires).min(Instant::now() + Duration::from_secs(policy.max_age));
     Ok(mta_sts)
 }
 

@@ -26,6 +26,12 @@ kumo.on('init', function()
       supplemental_header = false,
     },
   }
+  local server_cert = os.getenv 'KUMOD_SINK_TLS_CERT'
+  if server_cert then
+    smtp_params.tls_certificate = { key_data = server_cert }
+    smtp_params.tls_private_key =
+      { key_data = assert(os.getenv 'KUMOD_SINK_TLS_KEY') }
+  end
   local client_ca = os.getenv 'KUMOD_CLIENT_REQUIRED_CA'
   if client_ca then
     smtp_params.tls_required_client_ca = {
@@ -104,6 +110,22 @@ kumo.on('smtp_server_mail_from', function(sender)
 end)
 
 kumo.on('smtp_server_message_received', function(msg)
+  local control = os.getenv 'KUMOD_MTA_STS_CONTROL'
+  if control and msg:recipient().user == 'held' then
+    local entered = assert(io.open(control .. '/entered', 'w'))
+    entered:close()
+    local released = false
+    for _ = 1, 300 do
+      local release = io.open(control .. '/release')
+      if release then
+        release:close()
+        released = true
+        break
+      end
+      kumo.time.sleep(0.05)
+    end
+    assert(released, 'test did not release held delivery')
+  end
   local sender = msg:sender().user
   if utils.starts_with(sender, 'disconnect-in-data-no-421') then
     kumo.disconnect(451, 'disconnecting ' .. sender, 'ForceDisconnect')
@@ -154,6 +176,9 @@ kumo.on('smtp_server_ehlo', function(domain, conn_meta, extensions)
       include = false
     end
     if ext == 'SMTPUTF8' and os.getenv 'KUMOD_HIDE_SMTPUTF8' then
+      include = false
+    end
+    if ext == 'STARTTLS' and os.getenv 'KUMOD_HIDE_STARTTLS' then
       include = false
     end
     if include then

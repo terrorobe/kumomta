@@ -14,7 +14,7 @@ use nom_utils::{
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 
 /// A `serde_with` adapter that serializes `BString` as a JSON string when
@@ -609,198 +609,6 @@ fn test_obs_local_part_encode_roundtrip() {
 
 #[cfg(test)]
 #[test]
-fn test_encode_folds_long_mailbox_display_name() {
-    let mailbox = Mailbox {
-        name: Some(
-            "The Honorable Regional Manager of the Northwestern Sales Territory Office".to_string(),
-        ),
-        address: AddrSpec::new("alex", "example.com"),
-    };
-    let encoded = mailbox.encode_value().to_string();
-    k9::snapshot!(
-        BString::from(encoded.clone()),
-        r#"
-"The Honorable Regional Manager of the Northwestern Sales Territory Office"\r
-\t<alex@example.com>
-"#
-    );
-    k9::assert_equal!(
-        Parser::parse_mailbox_header(encoded.as_bytes()).unwrap(),
-        mailbox
-    );
-}
-
-#[cfg(test)]
-#[test]
-fn test_crlf_injection_via_display_name() {
-    // A display name may pick up a stray CR/LF, for example a value imported
-    // from another system with an embedded line break. Rewriting it to a space
-    // keeps it from terminating the header line: re-parsing the header block
-    // yields a single From header, not a spurious second one.
-    let mailbox = Mailbox {
-        name: Some("Ada Lovelace\r\nNotes: imported".to_string()),
-        address: AddrSpec::new("alex", "example.com"),
-    };
-    let encoded = mailbox.encode_value().to_string();
-    k9::snapshot!(
-        BString::from(encoded.clone()),
-        r#""Ada Lovelace  Notes: imported" <alex@example.com>"#
-    );
-
-    let header_block = format!("From: {encoded}\r\n\r\n");
-    let parsed = crate::Header::parse_headers(header_block).unwrap();
-    let names: Vec<String> = parsed
-        .headers
-        .iter()
-        .map(|h| h.get_name().to_string())
-        .collect();
-    k9::snapshot!(
-        names,
-        r#"
-[
-    "From",
-]
-"#
-    );
-}
-
-#[cfg(test)]
-#[test]
-fn test_bare_lf_injection_via_display_name() {
-    // Same as test_crlf_injection_via_display_name, for a bare LF with no
-    // preceding CR: quote_string's fold check has a separate match arm for
-    // this case, so it needs its own regression coverage.
-    let mailbox = Mailbox {
-        name: Some("Ada Lovelace\nNotes: imported".to_string()),
-        address: AddrSpec::new("alex", "example.com"),
-    };
-    let encoded = mailbox.encode_value().to_string();
-    k9::snapshot!(
-        BString::from(encoded.clone()),
-        r#""Ada Lovelace Notes: imported" <alex@example.com>"#
-    );
-
-    let header_block = format!("From: {encoded}\r\n\r\n");
-    let parsed = crate::Header::parse_headers(header_block).unwrap();
-    let names: Vec<String> = parsed
-        .headers
-        .iter()
-        .map(|h| h.get_name().to_string())
-        .collect();
-    k9::snapshot!(
-        names,
-        r#"
-[
-    "From",
-]
-"#
-    );
-}
-
-#[cfg(test)]
-#[test]
-fn test_encode_folds_non_ascii_mailbox_display_name() {
-    // Use a non-ASCII name long enough that qp_encode itself folds it into
-    // multiple encoded-words joined by "\r\n\t". The addr-spec fold decision
-    // must measure only the last physical line of the encoded phrase, not the
-    // total length of the phrase, or it would spuriously trigger another fold
-    // before <addr> regardless of how short the last line actually is. No
-    // round-trip assertion: decoding a qp_encode fold that lands mid-word
-    // reconstructs a space at the boundary, a separate, pre-existing lossy
-    // round-trip in the phrase parser.
-    let mailbox = Mailbox {
-        name: Some("日本語の非常に長い表示名前です本当に長いですよ".repeat(3)),
-        address: AddrSpec::new("alex", "example.com"),
-    };
-    let encoded = mailbox.encode_value().to_string();
-    // Whether to insert a fold before <addr> is decided by whether appending
-    // <addr> to the last qp_encode line would exceed the fold width, using the
-    // length of that last physical line rather than the total encoded length.
-    // Here it does not exceed the width, so no further fold is inserted.
-    k9::snapshot!(
-        BString::from(encoded.clone()),
-        r#"
-=?UTF-8?q?=E6=97=A5=E6=9C=AC=E8=AA=9E=E3=81=AE=E9=9D=9E=E5=B8=B8?=\r
-\t=?UTF-8?q?=E3=81=AB=E9=95=B7=E3=81=84=E8=A1=A8=E7=A4=BA=E5=90=8D?=\r
-\t=?UTF-8?q?=E5=89=8D=E3=81=A7=E3=81=99=E6=9C=AC=E5=BD=93=E3=81=AB?=\r
-\t=?UTF-8?q?=E9=95=B7=E3=81=84=E3=81=A7=E3=81=99=E3=82=88=E6=97=A5?=\r
-\t=?UTF-8?q?=E6=9C=AC=E8=AA=9E=E3=81=AE=E9=9D=9E=E5=B8=B8=E3=81=AB?=\r
-\t=?UTF-8?q?=E9=95=B7=E3=81=84=E8=A1=A8=E7=A4=BA=E5=90=8D=E5=89=8D?=\r
-\t=?UTF-8?q?=E3=81=A7=E3=81=99=E6=9C=AC=E5=BD=93=E3=81=AB=E9=95=B7?=\r
-\t=?UTF-8?q?=E3=81=84=E3=81=A7=E3=81=99=E3=82=88=E6=97=A5=E6=9C=AC?=\r
-\t=?UTF-8?q?=E8=AA=9E=E3=81=AE=E9=9D=9E=E5=B8=B8=E3=81=AB=E9=95=B7?=\r
-\t=?UTF-8?q?=E3=81=84=E8=A1=A8=E7=A4=BA=E5=90=8D=E5=89=8D=E3=81=A7?=\r
-\t=?UTF-8?q?=E3=81=99=E6=9C=AC=E5=BD=93=E3=81=AB=E9=95=B7=E3=81=84?=\r
-\t=?UTF-8?q?=E3=81=A7=E3=81=99=E3=82=88?= <alex@example.com>
-"#
-    );
-    Parser::parse_mailbox_header(encoded.as_bytes()).unwrap();
-}
-
-#[cfg(test)]
-#[test]
-fn test_encode_folds_mailbox_list_at_boundaries() {
-    let list = MailboxList(vec![
-        Mailbox {
-            name: Some(
-                "The Honorable Regional Manager of the Northwestern Sales Territory".to_string(),
-            ),
-            address: AddrSpec::new("alex", "example.com"),
-        },
-        Mailbox {
-            name: Some("Bob Smith".to_string()),
-            address: AddrSpec::new("bob", "example.com"),
-        },
-    ]);
-    let encoded = list.encode_value().to_string();
-    k9::snapshot!(
-        BString::from(encoded.clone()),
-        r#"
-"The Honorable Regional Manager of the Northwestern Sales Territory"\r
-\t<alex@example.com>,\r
-\t"Bob Smith" <bob@example.com>
-"#
-    );
-    k9::assert_equal!(
-        Parser::parse_mailbox_list_header(encoded.as_bytes()).unwrap(),
-        list
-    );
-}
-
-#[cfg(test)]
-#[test]
-fn test_encode_folds_address_list_at_boundaries() {
-    // Same as the mailbox-list case, for the address-list headers
-    // (To/Cc/Bcc/Reply-To).
-    let list = AddressList(vec![
-        Address::Mailbox(Mailbox {
-            name: Some(
-                "The Honorable Regional Manager of the Northwestern Sales Territory".to_string(),
-            ),
-            address: AddrSpec::new("alex", "example.com"),
-        }),
-        Address::Mailbox(Mailbox {
-            name: Some("Bob Smith".to_string()),
-            address: AddrSpec::new("bob", "example.com"),
-        }),
-    ]);
-    let encoded = list.encode_value().to_string();
-    k9::snapshot!(
-        BString::from(encoded.clone()),
-        r#"
-"The Honorable Regional Manager of the Northwestern Sales Territory"\r
-\t<alex@example.com>,\r
-\t"Bob Smith" <bob@example.com>
-"#
-    );
-    k9::assert_equal!(
-        Parser::parse_address_list_header(encoded.as_bytes()).unwrap(),
-        list
-    );
-}
-
-#[cfg(test)]
-#[test]
 fn test_obs_local_part_with_special_chars() {
     // obs-local-part where the quoted-string word contains characters
     // that require quoting (space, specials)
@@ -1079,37 +887,11 @@ fn cfws(input: Span) -> IResult<Span, Span> {
     .parse(input)
 }
 
-// comment = { "(" ~ (fws? ~ (ccontent_atom | comment))* ~ fws? ~ ")" }
+// comment = { "(" ~ (fws? ~ ccontent)* ~ fws? ~ ")" }
 fn comment(input: Span) -> IResult<Span, Span> {
-    // Track nesting depth explicitly instead of recursing to prevent a deeply
-    // nested comment from exhausting the stack.
     context(
         "comment",
-        recognize(|input| {
-            let (mut input, _) = tag("(").parse(input)?;
-            let mut depth = 1usize;
-
-            while depth > 0 {
-                let (remaining, _) = opt(fws).parse(input)?;
-                input = remaining;
-
-                match input.fragment().first() {
-                    Some(b'(') => {
-                        (input, _) = tag("(").parse(input)?;
-                        depth += 1;
-                    }
-                    Some(b')') => {
-                        (input, _) = tag(")").parse(input)?;
-                        depth -= 1;
-                    }
-                    _ => {
-                        (input, _) = ccontent_atom.parse(input)?;
-                    }
-                }
-            }
-
-            Ok((input, ()))
-        }),
+        recognize((tag("("), many0((opt(fws), ccontent)), opt(fws), tag(")"))),
     )
     .parse(input)
 }
@@ -1123,34 +905,14 @@ fn test_comment() {
     );
 }
 
-#[cfg(test)]
-#[test]
-fn deeply_nested_comment_does_not_overflow_the_stack() {
-    let input = format!(
-        "probe@example.invalid {}{}",
-        "(".repeat(10_000),
-        ")".repeat(10_000)
-    );
-
-    k9::assert_equal!(
-        parse_with(input.as_bytes(), mailbox).unwrap(),
-        Mailbox {
-            name: None,
-            address: AddrSpec {
-                local_part: "probe".to_string(),
-                domain: "example.invalid".to_string(),
-            },
-        }
-    );
-}
-
-// ccontent = { ctext | quoted_pair | encoded_word }
-fn ccontent_atom(input: Span) -> IResult<Span, Span> {
+// ccontent = { ctext | quoted_pair | comment | encoded_word }
+fn ccontent(input: Span) -> IResult<Span, Span> {
     context(
-        "ccontent_atom",
+        "ccontent",
         recognize(alt((
             recognize(alt((take_while_m_n(1, 1, is_ctext_ascii), utf8_non_ascii))),
             recognize(quoted_pair),
+            comment,
             recognize(encoded_word),
         ))),
     )
@@ -2096,15 +1858,7 @@ impl EncodeHeaderValue for ARCAuthenticationResults {
                     emit_value_token(reason.as_bytes(), &mut result);
                 }
                 for (k, v) in &res.props {
-                    // Skip a key that sanitizes to nothing. Emitting `=value`
-                    // with no key would be a malformed (though not injectable)
-                    // value.
-                    if !k.chars().any(is_prop_key_char) {
-                        continue;
-                    }
-                    result.push_str("\r\n\t");
-                    emit_prop_key(k, &mut result);
-                    result.push(b'=');
+                    result.push_str(format!("\r\n\t{k}="));
                     emit_value_token(v.as_bytes(), &mut result);
                 }
             }
@@ -2126,24 +1880,13 @@ pub struct AuthenticationResults {
     pub results: Vec<AuthenticationResult>,
 }
 
-/// Emits an Authentication-Results value into target, quoting it when it
-/// contains anything outside the mime-token set, and dropping control
-/// characters.
+/// Emits a value that was parsed by `value`, into target
 fn emit_value_token(value: &[u8], target: &mut Vec<u8>) {
     // Allow '@' bare since the pvalue parser handles @domain and local@domain
     let use_quoted_string = !value.iter().all(|&c| is_mime_token(c) || c == b'@');
     if use_quoted_string {
         target.push(b'"');
         for (start, end, c) in value.char_indices() {
-            // Drop control characters other than HTAB: a bare CR or LF inside a
-            // quoted-string ends the header line, and a sender-controlled value
-            // could use that to inject further lines beneath ours. HTAB is
-            // legal FWS inside a quoted-string, so it is preserved. A raw
-            // control byte decodes via char_indices to its own ASCII character,
-            // so it is caught here rather than as invalid UTF-8.
-            if c.is_control() && c != '\t' {
-                continue;
-            }
             if c == '"' || c == '\\' {
                 target.push(b'\\');
             }
@@ -2152,23 +1895,6 @@ fn emit_value_token(value: &[u8], target: &mut Vec<u8>) {
         target.push(b'"');
     } else {
         target.push_str(value);
-    }
-}
-
-/// Returns true when the character is one an RFC 8601 property key may contain:
-/// ASCII alphanumerics, `-`, and `.`.
-fn is_prop_key_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '.'
-}
-
-/// Emits a property key (`ptype.property`) into target, keeping only the
-/// characters a key may contain. A key is always emitted unquoted. Any other
-/// byte is dropped, including a control character from a Lua-supplied key.
-fn emit_prop_key(key: &str, target: &mut Vec<u8>) {
-    for c in key.chars() {
-        if is_prop_key_char(c) {
-            target.push(c as u8);
-        }
     }
 }
 
@@ -2195,15 +1921,7 @@ impl EncodeHeaderValue for AuthenticationResults {
                     emit_value_token(reason.as_bytes(), &mut result);
                 }
                 for (k, v) in &res.props {
-                    // Skip a key that sanitizes to nothing. Emitting `=value`
-                    // with no key would be a malformed (though not injectable)
-                    // value.
-                    if !k.chars().any(is_prop_key_char) {
-                        continue;
-                    }
-                    result.push_str("\r\n\t");
-                    emit_prop_key(k, &mut result);
-                    result.push(b'=');
+                    result.push_str(format!("\r\n\t{k}="));
                     emit_value_token(v.as_bytes(), &mut result);
                 }
             }
@@ -2408,58 +2126,27 @@ impl MimeParameters {
     /// Incorrectly encoded parameters are silently ignored
     /// and are not returned in the resulting map.
     pub fn parameter_map(&self) -> BTreeMap<BString, BString> {
-        self.grouped_parameters().into_values().collect()
-    }
+        let mut map = BTreeMap::new();
 
-    /// Returns each distinct parameter name mapped to the original spelling
-    /// of its first occurrence and its decoded value. Keyed by the lowercased
-    /// name to fold case-insensitive duplicates together. Grouping in one pass
-    /// keeps this linearithmic rather than quadratic in the parameter count.
-    fn grouped_parameters(&self) -> BTreeMap<BString, (BString, BString)> {
-        let mut groups: BTreeMap<BString, (BString, Vec<&MimeParameter>)> = BTreeMap::new();
-        for entry in &self.parameters {
-            let folded: BString = entry.name.to_ascii_lowercase().into();
-            groups
-                .entry(folded)
-                .or_insert_with(|| (entry.name.clone(), vec![]))
-                .1
-                .push(entry);
+        fn contains_key_ignore_case(map: &BTreeMap<BString, BString>, key: &[u8]) -> bool {
+            for k in map.keys() {
+                if k.eq_ignore_ascii_case(key) {
+                    return true;
+                }
+            }
+            false
         }
-        groups
-            .into_iter()
-            .map(|(folded, (display_name, elements))| {
-                (
-                    folded,
-                    (display_name, Self::decode_parameter_elements(elements)),
-                )
-            })
-            .collect()
-    }
 
-    /// Insert each incoming parameter whose name is not already present
-    /// (case-insensitively), leaving existing parameters untouched. Incoming
-    /// values are stored verbatim with no encoding. The set of present names is
-    /// computed once, keeping the merge linearithmic rather than quadratic in
-    /// the combined parameter count.
-    pub fn merge_missing_parameters(&mut self, incoming: BTreeMap<BString, BString>) {
-        let mut present: BTreeSet<BString> = self
-            .parameters
-            .iter()
-            .map(|p| p.name.to_ascii_lowercase().into())
-            .collect();
-        for (name, value) in incoming {
-            let folded: BString = name.to_ascii_lowercase().into();
-            if present.insert(folded) {
-                self.parameters.push(MimeParameter {
-                    name,
-                    value,
-                    section: None,
-                    mime_charset: None,
-                    mime_language: None,
-                    encoding: MimeParameterEncoding::None,
-                });
+        for entry in &self.parameters {
+            let name = entry.name.as_bytes();
+            if !contains_key_ignore_case(&map, name) {
+                if let Some(value) = self.get(name) {
+                    map.insert(name.into(), value);
+                }
             }
         }
+
+        map
     }
 
     /// Retrieve the value for a named parameter.
@@ -2469,37 +2156,15 @@ impl MimeParameters {
     /// Invalid charsets and encoding will be silently ignored.
     pub fn get(&self, name: impl AsRef<[u8]>) -> Option<BString> {
         let name = name.as_ref();
-        let elements: Vec<_> = self
+        let mut elements: Vec<_> = self
             .parameters
             .iter()
-            .filter(|p| p.name.eq_ignore_ascii_case(name))
+            .filter(|p| p.name.eq_ignore_ascii_case(name.as_bytes()))
             .collect();
         if elements.is_empty() {
             return None;
         }
-        Some(Self::decode_parameter_elements(elements))
-    }
-
-    /// Decode a group of parameter elements that share a name into a value,
-    /// ordering multi-part (RFC 2231 sectioned) elements by section and
-    /// applying any %-encoding. Invalid charsets and encodings are silently
-    /// ignored.
-    ///
-    /// A well-formed parameter names each RFC 2231 continuation section at most
-    /// once (RFC 2231 s3), and a simple parameter (no section) appears once
-    /// (RFC 2045 s5.1). A repeated section, or a repeated simple parameter, is
-    /// malformed. The last occurrence wins. `elements` is taken in document
-    /// order so that last is the one appearing latest in the header.
-    fn decode_parameter_elements(elements: Vec<&MimeParameter>) -> BString {
-        // Deduplicate by section, keeping the last occurrence, and order by
-        // section. A BTreeMap keyed on Option<u32> orders None (the simple,
-        // unsectioned form) before the numerically-ordered sections.
-        let elements: Vec<&MimeParameter> = elements
-            .into_iter()
-            .map(|ele| (ele.section, ele))
-            .collect::<BTreeMap<_, _>>()
-            .into_values()
-            .collect();
+        elements.sort_by(|a, b| a.section.cmp(&b.section));
 
         let mut mime_charset = None;
         let mut result: Vec<u8> = vec![];
@@ -2578,7 +2243,7 @@ impl MimeParameters {
             }
         }
 
-        result.into()
+        Some(result.into())
     }
 
     /// Remove the named parameter
@@ -2622,7 +2287,6 @@ impl MimeParameters {
 impl EncodeHeaderValue for MimeParameters {
     fn encode_value(&self) -> SharedString<'static> {
         let mut result = self.value.clone();
-        let grouped = self.grouped_parameters();
         let names: BTreeMap<&BStr, MimeParameterEncoding> = self
             .parameters
             .iter()
@@ -2630,11 +2294,7 @@ impl EncodeHeaderValue for MimeParameters {
             .collect();
 
         for (name, stated_encoding) in names {
-            let folded: BString = name.to_ascii_lowercase().into();
-            let value = grouped
-                .get(&folded)
-                .map(|(_display_name, value)| value.clone())
-                .expect("name to be present");
+            let value = self.get(name).expect("name to be present");
 
             match stated_encoding {
                 MimeParameterEncoding::UnquotedRfc2047 => {
@@ -2665,16 +2325,11 @@ impl EncodeHeaderValue for MimeParameters {
                         } else {
                             ""
                         };
-                        // A parameter name longer than the fold target makes
-                        // the framing wider than the target. Saturate to zero
-                        // rather than underflow. The loop below always consumes
-                        // at least one character per line, keeping progress
-                        // even when the budget is zero.
-                        let limit = 74usize.saturating_sub(name.len() + 4 + prefix.len());
+                        let limit = 74 - (name.len() + 4 + prefix.len());
 
                         let mut encoded: Vec<u8> = vec![];
 
-                        loop {
+                        while encoded.len() < limit {
                             let Some((start, end, c)) = chars.next() else {
                                 break;
                             };
@@ -2696,10 +2351,6 @@ impl EncodeHeaderValue for MimeParameters {
                                     encoded.push(HEX_CHARS[(b as usize) >> 4]);
                                     encoded.push(HEX_CHARS[(b as usize) & 0x0f]);
                                 }
-                            }
-
-                            if encoded.len() >= limit {
-                                break;
                             }
                         }
 
@@ -2893,23 +2544,6 @@ fn quote_string(s: impl AsRef<[u8]>) -> BString {
             let c = c as u32;
             if c <= 0xff {
                 let c = c as u8;
-                if c == b'\r' || c == b'\n' {
-                    // A CR/LF that is part of a legal RFC 5322 fold (a CR?LF
-                    // immediately followed by WSP) is kept: it is valid header
-                    // structure, not injection. A bare CR/LF is rewritten to a
-                    // space so it cannot terminate the header line and let the
-                    // bytes after it be read as a separate, spurious header.
-                    let is_fold = match c {
-                        b'\r' => matches!(&s[end..], [b'\n', b' ' | b'\t', ..]),
-                        _ => matches!(&s[end..], [b' ' | b'\t', ..]),
-                    };
-                    if is_fold {
-                        result.push_str(&s[start..end]);
-                    } else {
-                        result.push(b' ');
-                    }
-                    continue;
-                }
                 if !c.is_ascii_whitespace() && !is_qtext(c) && !is_atext(c) {
                     result.push(b'\\');
                 }
@@ -2945,44 +2579,15 @@ impl EncodeHeaderValue for Mailbox {
     fn encode_value(&self) -> SharedString<'static> {
         match &self.name {
             Some(name) => {
-                // The display name (a quoted-string, or an RFC 2047
-                // encoded-word that may itself already be multi-line) and the
-                // `<addr>` are joined by a fold when they would overflow the
-                // line, which is the only safe point: folding inside a quoted
-                // display name would rewrite the display name content (a space
-                // becomes a tab once unfolded). A name whose last line exceeds
-                // the width is left as-is rather than corrupted by folding
-                // inside its quoting or an encoded-word.
-                let phrase: Vec<u8> = if name.is_ascii() {
+                let mut value: Vec<u8> = if name.is_ascii() {
                     quote_string(name).into()
                 } else {
                     qp_encode(name.as_bytes()).into_bytes()
                 };
 
-                let mut addr: Vec<u8> = vec![b'<'];
-                addr.push_str(self.address.encode_value().as_bytes());
-                addr.push(b'>');
-
-                // qp_encode may have already folded a long non-ASCII name into
-                // multiple encoded-words separated by `\r\n\t`. Only the last
-                // of those lines shares a line with `<addr>`, so measure from
-                // the final fold when deciding whether to fold before `<addr>`.
-                // quote_string only lets a raw `\n` through when it is part of
-                // a legal fold (CR?LF followed by WSP), so any `\n` remaining
-                // in `phrase` here is guaranteed to be a fold boundary, not
-                // arbitrary content.
-                let last_line_len = phrase
-                    .rfind_byte(b'\n')
-                    .map(|i| phrase.len() - (i + 1))
-                    .unwrap_or(phrase.len());
-
-                let mut value = phrase;
-                if last_line_len + 1 + addr.len() > kumo_wrap::SOFT_WIDTH {
-                    value.push_str("\r\n\t");
-                } else {
-                    value.push(b' ');
-                }
-                value.push_str(&addr);
+                value.push_str(" <");
+                value.push_str(self.address.encode_value().as_bytes());
+                value.push(b'>');
                 value.into()
             }
             None => {
@@ -3572,7 +3177,7 @@ Some(
         );
 
         k9::snapshot!(
-            BString::from(msg.rebuild(None).unwrap().to_message_bytes().unwrap()),
+            BString::from(msg.rebuild(None).unwrap().to_message_bytes()),
             r#"
 Content-Type: text/plain;\r
 \tcharset="us-ascii"\r
@@ -3929,122 +3534,6 @@ application/x-stuff;\r
 \tlongernnamethananyoneshouldreallyuse*5="lines produced as a result of set";\r
 \tlongernnamethananyoneshouldreallyuse*6="ting this value in this way";\r
 \ttitle="This is even more ***fun*** isn't it!"
-"#
-        );
-    }
-
-    #[test]
-    fn content_type_long_parameter_name() {
-        // A parameter name long enough that the fold framing exceeds the target
-        // line width used to drive an integer underflow (issue 608). Encoding
-        // must not panic, and each line must contain at least one character of
-        // the value.
-        let name = "x".repeat(70);
-        let mut params = MimeParameters::new("text/plain");
-        params.set(&name, "value");
-
-        k9::snapshot!(
-            params.encode_value(),
-            r#"
-text/plain;\r
-\txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*0="v";\r
-\txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*1="a";\r
-\txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*2="l";\r
-\txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*3="u";\r
-\txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*4="e"
-"#
-        );
-    }
-
-    #[test]
-    fn parameter_map_groups_case_insensitively() {
-        // Names differing only in case collapse to one entry keyed by the first
-        // spelling seen. A repeated simple parameter is malformed and the last
-        // occurrence wins.
-        let params =
-            Parser::parse_content_type_header(b"text/plain; Charset=utf-8; charset=latin-1")
-                .unwrap();
-        let map = params.parameter_map();
-        k9::assert_equal!(map.len(), 1);
-        k9::assert_equal!(map.get(BStr::new("Charset")).unwrap(), "latin-1");
-        k9::assert_equal!(params.get("CHARSET").unwrap(), "latin-1");
-    }
-
-    #[test]
-    fn parameter_map_many_distinct_parameters() {
-        // A header with many distinct parameters decodes to one map entry per
-        // parameter.
-        let mut value = b"text/plain".to_vec();
-        for i in 0..2000 {
-            value.extend_from_slice(format!("; p{i}=v{i}").as_bytes());
-        }
-        let params = Parser::parse_content_type_header(&value).unwrap();
-        let map = params.parameter_map();
-        k9::assert_equal!(map.len(), 2000);
-        k9::assert_equal!(map.get(BStr::new("p0")).unwrap(), "v0");
-        k9::assert_equal!(map.get(BStr::new("p1999")).unwrap(), "v1999");
-    }
-
-    #[test]
-    fn merge_missing_parameters_skips_present_names() {
-        let mut dest = Parser::parse_content_type_header(b"text/plain; charset=utf-8").unwrap();
-        let incoming =
-            Parser::parse_content_type_header(b"text/plain; CharSet=latin-1; name=file.txt")
-                .unwrap();
-        dest.merge_missing_parameters(incoming.parameter_map());
-        // charset is already present (case-insensitively) and keeps its value;
-        // name is new and is added.
-        k9::assert_equal!(dest.get("charset").unwrap(), "utf-8");
-        k9::assert_equal!(dest.get("name").unwrap(), "file.txt");
-    }
-
-    #[test]
-    fn duplicate_simple_parameter_last_wins() {
-        // A repeated simple (unsectioned) parameter keeps the last value.
-        let params =
-            Parser::parse_content_type_header(b"text/plain; charset=utf-8; charset=latin-1")
-                .unwrap();
-        k9::assert_equal!(params.get("charset").unwrap(), "latin-1");
-    }
-
-    #[test]
-    fn multi_section_parameter_orders_numerically() {
-        // Sections are compared as integers, not lexically. A lexical
-        // comparison would place *10 and *11 between *1 and *2. The sections
-        // are supplied out of order to prove the decode sorts them.
-        let mut header = b"text/plain".to_vec();
-        for section in [0u32, 10, 2, 11, 1, 3, 4, 5, 6, 7, 8, 9] {
-            header.extend_from_slice(format!("; title*{section}=v{section}x").as_bytes());
-        }
-        let params = Parser::parse_content_type_header(&header).unwrap();
-        k9::assert_equal!(
-            params.get("title").unwrap(),
-            "v0xv1xv2xv3xv4xv5xv6xv7xv8xv9xv10xv11x"
-        );
-    }
-
-    #[test]
-    fn merge_missing_parameters_reencodes_non_ascii() {
-        // A merged non-ASCII value round-trips through get, and encode_value
-        // renders it as RFC 2231 charset-tagged continuation sections.
-        let mut dest = MimeParameters::new("text/plain");
-        let mut incoming = BTreeMap::new();
-        incoming.insert(
-            BString::from("title"),
-            BString::from("\u{65e5}\u{672c}\u{8a9e} ".repeat(6).trim_end().as_bytes()),
-        );
-        dest.merge_missing_parameters(incoming);
-        k9::assert_equal!(
-            dest.get("title").unwrap(),
-            "\u{65e5}\u{672c}\u{8a9e} \u{65e5}\u{672c}\u{8a9e} \u{65e5}\u{672c}\u{8a9e} \u{65e5}\u{672c}\u{8a9e} \u{65e5}\u{672c}\u{8a9e} \u{65e5}\u{672c}\u{8a9e}"
-        );
-        k9::snapshot!(
-            dest.encode_value(),
-            r#"
-text/plain;\r
-\ttitle*0*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20;\r
-\ttitle*1*=%E6%97%A5%E6%9C%AC%E8%AA%9E%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20%E6%97%A5;\r
-\ttitle*2*=%E6%9C%AC%E8%AA%9E%20%E6%97%A5%E6%9C%AC%E8%AA%9E
 "#
         );
     }
@@ -4628,125 +4117,6 @@ ARCAuthenticationResults {
         let parsed = Parser::parse_authentication_results_header(encoded2.as_bytes()).unwrap();
         k9::assert_equal!(parsed.serv_id, ar2.serv_id);
         k9::assert_equal!(parsed.version, Some(1));
-    }
-
-    #[test]
-    fn authentication_results_encode_drops_injected_control_chars() {
-        // Sender-influenced values (here a DMARC policy prop and a reason)
-        // containing CR/LF must not split the emitted header.
-        let mut props = std::collections::BTreeMap::new();
-        props.insert(
-            "policy.rua".to_string(),
-            BString::from(&b"a\r\nX-Injected: y"[..]),
-        );
-        let ar = AuthenticationResults {
-            serv_id: BString::from(&b"mx.ex\r\nX-Serv: z.com"[..]),
-            version: None,
-            results: vec![AuthenticationResult {
-                method: "dmarc".into(),
-                method_version: None,
-                result: "pass".into(),
-                reason: Some(BString::from(&b"ok\r\nX-Evil: yes"[..])),
-                props,
-            }],
-        };
-        let encoded = ar.encode_value().to_string();
-
-        // The injected content is preserved minus its control characters. The
-        // only CRLFs left are the structural folds this encoder inserts. A new
-        // header line cannot appear beneath ours.
-        k9::assert_equal!(
-            encoded,
-            "\"mx.exX-Serv: z.com\";\r\n\tdmarc=pass reason=\"okX-Evil: yes\"\
-             \r\n\tpolicy.rua=\"aX-Injected: y\""
-        );
-
-        // After removing the structural folds, nothing survives that a header
-        // parser would treat as a line break.
-        let unfolded = encoded.replace("\r\n\t", "");
-        assert!(!unfolded.contains('\r'), "residual CR in {encoded:?}");
-        assert!(!unfolded.contains('\n'), "residual LF in {encoded:?}");
-    }
-
-    #[test]
-    fn authentication_results_encode_drops_controls_in_keys_and_arc() {
-        // A property key sourced from Lua policy can contain structural bytes;
-        // they must not survive into the header.
-        let mut props = std::collections::BTreeMap::new();
-        props.insert("policy; x=evil".to_string(), BString::from("v"));
-        let arc = ARCAuthenticationResults {
-            instance: 1,
-            serv_id: BString::from(&b"mx\x00.ex"[..]),
-            version: None,
-            results: vec![AuthenticationResult {
-                method: "dmarc".into(),
-                method_version: None,
-                result: "pass".into(),
-                reason: None,
-                props,
-            }],
-        };
-        let encoded = arc.encode_value().to_string();
-        // The key is reduced to its mime-token characters. The NUL in the
-        // serv_id is dropped.
-        k9::assert_equal!(
-            encoded,
-            "i=1; \"mx.ex\";\r\n\tdmarc=pass\r\n\tpolicyxevil=v"
-        );
-    }
-
-    #[test]
-    fn authentication_results_encode_omits_prop_with_empty_key() {
-        // A key with no valid characters sanitizes to nothing. The whole prop
-        // is dropped rather than emitting a keyless `=value`.
-        let mut props = std::collections::BTreeMap::new();
-        props.insert(";;".to_string(), BString::from("v"));
-        let ar = AuthenticationResults {
-            serv_id: BString::from("mx.example.com"),
-            version: None,
-            results: vec![AuthenticationResult {
-                method: "dmarc".into(),
-                method_version: None,
-                result: "pass".into(),
-                reason: None,
-                props,
-            }],
-        };
-        k9::assert_equal!(
-            ar.encode_value().to_string(),
-            "mx.example.com;\r\n\tdmarc=pass"
-        );
-    }
-
-    #[test]
-    fn authentication_results_encode_preserves_unicode() {
-        // U+010D (\u{10d}) has low byte 0x0D (CR). A byte-truncating control
-        // check would drop it. It must survive byte-for-byte.
-        let ar = AuthenticationResults {
-            serv_id: BString::from("m\u{10d}.example.com"),
-            version: None,
-            results: vec![],
-        };
-        let encoded = ar.encode_value();
-        k9::assert_equal!(encoded, "\"m\u{10d}.example.com\"; none");
-    }
-
-    #[test]
-    fn authentication_results_encode_drops_obs_qp_control_from_parsed_header() {
-        // The parser accepts obs-qp escapes of CR/LF/NUL inside quoted
-        // strings and stores the literal control byte in the parsed value.
-        // Re-encoding that value (as ARC sealing does) must not emit the
-        // control character.
-        let header = b"\"mx.ex\\\rX-Serv: z.com\"; none";
-        let parsed = Parser::parse_authentication_results_header(header).unwrap();
-        assert!(
-            parsed.serv_id.as_bytes().contains(&b'\r'),
-            "parser should retain the raw CR"
-        );
-        let encoded = parsed.encode_value().to_string();
-        let unfolded = encoded.replace("\r\n\t", "");
-        assert!(!unfolded.contains('\r'), "residual CR in {encoded:?}");
-        assert!(!unfolded.contains('\n'), "residual LF in {encoded:?}");
     }
 
     #[test]

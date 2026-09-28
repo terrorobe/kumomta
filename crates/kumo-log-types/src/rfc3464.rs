@@ -380,13 +380,12 @@ pub(crate) fn content_type(part: &MimePart) -> Option<BString> {
 
 impl Report {
     pub fn parse(input: &[u8]) -> anyhow::Result<Option<Self>> {
-        // The chained MimePart::parse error states the parse-failure reason.
-        // This closure runs on every failed parse, including callers that then
-        // discard the error, and the input can be a whole received message.
-        // Record its size rather than building an escaped, message-sized copy
-        // each time.
-        let mail = MimePart::parse(input)
-            .with_context(|| format!("Report::parse top; input is {} bytes", input.len()))?;
+        let mail = MimePart::parse(input).with_context(|| {
+            format!(
+                "Report::parse top; input is {:?}",
+                String::from_utf8_lossy(input)
+            )
+        })?;
 
         if content_type(&mail).as_ref().map(|b| b.as_bstr()) != Some(BStr::new("multipart/report"))
         {
@@ -570,16 +569,12 @@ impl Report {
                 );
             }
             (IncludeOriginalMessage::FullContent, Some(msg)) => {
-                // A message that cannot be re-serialized (such as a multipart
-                // missing a usable boundary) is omitted from the report rather
-                // than failing the whole report generation.
                 let mut data = vec![];
-                if msg.write_message(&mut data).is_ok() {
-                    parts.push(
-                        MimePart::new_no_transfer_encoding("message/rfc822", &data)
-                            .context("new_no_transfer_encoding")?,
-                    );
-                }
+                msg.write_message(&mut data).ok();
+                parts.push(
+                    MimePart::new_no_transfer_encoding("message/rfc822", &data)
+                        .context("new_no_transfer_encoding")?,
+                );
             }
         };
 
@@ -673,7 +668,6 @@ pub struct ReportGenerationParams {
 mod test {
     use super::*;
     use crate::ResolvedAddress;
-    use mailparsing::MessageConformance;
     use rfc5321::{EnhancedStatusCode, Response};
 
     #[test]
@@ -858,7 +852,7 @@ Report {
         let report_msg = Report::generate(&params, Some(&original_msg), &log)
             .unwrap()
             .unwrap();
-        let report_eml = BString::from(report_msg.to_message_bytes().unwrap());
+        let report_eml = BString::from(report_msg.to_message_bytes());
         k9::snapshot!(
             &report_eml,
             r#"
@@ -866,7 +860,7 @@ Content-Type: multipart/report;\r
 \tboundary="report-boundary";\r
 \treport-type="delivery-status"\r
 Subject: Returned mail\r
-MIME-Version: 1.0\r
+Mime-Version: 1.0\r
 Message-ID: <UUID@mta1.example.com>\r
 To: sender@sender.example.com\r
 From: Mail Delivery Subsystem <mailer-daemon@mta1.example.com>\r
@@ -989,7 +983,7 @@ Subject: Hello!
         let report_msg = Report::generate(&params, Some(&original_msg), &log)
             .unwrap()
             .unwrap();
-        let report_eml = BString::from(report_msg.to_message_bytes().unwrap());
+        let report_eml = BString::from(report_msg.to_message_bytes());
         k9::snapshot!(
             &report_eml,
             r#"
@@ -997,7 +991,7 @@ Content-Type: multipart/report;\r
 \tboundary="report-boundary";\r
 \treport-type="delivery-status"\r
 Subject: Returned mail\r
-MIME-Version: 1.0\r
+Mime-Version: 1.0\r
 Message-ID: <UUID@mta1.example.com>\r
 To: sender@sender.example.com\r
 From: Mail Delivery Subsystem <mailer-daemon@mta1.example.com>\r
@@ -1122,7 +1116,7 @@ Subject: Hello!
         let report_msg = Report::generate(&params, Some(&original_msg), &log)
             .unwrap()
             .unwrap();
-        let report_eml = BString::from(report_msg.to_message_bytes().unwrap());
+        let report_eml = BString::from(report_msg.to_message_bytes());
         k9::snapshot!(
             &report_eml,
             r#"
@@ -1130,7 +1124,7 @@ Content-Type: multipart/report;\r
 \tboundary="report-boundary";\r
 \treport-type="delivery-status"\r
 Subject: Returned mail\r
-MIME-Version: 1.0\r
+Mime-Version: 1.0\r
 Message-ID: <UUID@mta1.example.com>\r
 To: sender@sender.example.com\r
 From: Mail Delivery Subsystem <mailer-daemon@mta1.example.com>\r
@@ -1240,42 +1234,6 @@ hello there
         );
     }
 
-    // Asserts that we can successfully generate a report when the original
-    // message has malformed and unsuable boundary lines.
-    #[test]
-    fn generate_bounce_with_invalid_boundary_message() {
-        let params = ReportGenerationParams {
-            reporting_mta: RemoteMta {
-                mta_type: "dns".to_string(),
-                name: "mta1.example.com".to_string(),
-            },
-            enable_bounce: true,
-            enable_expiration: true,
-            include_original_message: IncludeOriginalMessage::FullContent,
-            stable_content: true,
-        };
-
-        const ORIGINAL: &[u8] =
-            b"Subject: Broken\r\nContent-Type: multipart/mixed; boundary=\r\n\r\n--\r\nbody\r\n";
-        let original_msg = MimePart::parse(ORIGINAL).unwrap();
-        assert!(original_msg
-            .conformance()
-            .contains(MessageConformance::MIME_INVALID_BOUNDARY));
-
-        let log = make_bounce();
-
-        let report_msg = Report::generate(&params, Some(&original_msg), &log)
-            .unwrap()
-            .unwrap();
-        let report_eml = BString::from(report_msg.to_message_bytes().unwrap());
-
-        let embedded = format!("message/rfc822\r\n\r\n{}", BString::from(ORIGINAL.to_vec()));
-        assert!(
-            report_eml.contains_str(&embedded),
-            "report should embed the original verbatim; got:\n{report_eml}"
-        );
-    }
-
     #[test]
     fn generate_bounce_no_message() {
         let params = ReportGenerationParams {
@@ -1296,7 +1254,7 @@ hello there
         let report_msg = Report::generate(&params, Some(&original_msg), &log)
             .unwrap()
             .unwrap();
-        let report_eml = BString::from(report_msg.to_message_bytes().unwrap());
+        let report_eml = BString::from(report_msg.to_message_bytes());
         k9::snapshot!(
             &report_eml,
             r#"
@@ -1304,7 +1262,7 @@ Content-Type: multipart/report;\r
 \tboundary="report-boundary";\r
 \treport-type="delivery-status"\r
 Subject: Returned mail\r
-MIME-Version: 1.0\r
+Mime-Version: 1.0\r
 Message-ID: <UUID@mta1.example.com>\r
 To: sender@sender.example.com\r
 From: Mail Delivery Subsystem <mailer-daemon@mta1.example.com>\r
@@ -1421,7 +1379,7 @@ Report {
         log.created = chrono::Utc.with_ymd_and_hms(60123, 1, 1, 0, 0, 0).unwrap();
 
         let report_msg = Report::generate(&params, None, &log).unwrap().unwrap();
-        let report_eml = BString::from(report_msg.to_message_bytes().unwrap());
+        let report_eml = BString::from(report_msg.to_message_bytes());
         k9::snapshot!(
             &report_eml,
             r#"
@@ -1429,7 +1387,7 @@ Content-Type: multipart/report;\r
 \tboundary="report-boundary";\r
 \treport-type="delivery-status"\r
 Subject: Returned mail\r
-MIME-Version: 1.0\r
+Mime-Version: 1.0\r
 Message-ID: <UUID@mta1.example.com>\r
 To: sender@sender.example.com\r
 From: Mail Delivery Subsystem <mailer-daemon@mta1.example.com>\r

@@ -1693,10 +1693,14 @@ impl Drop for ReadyQueue {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum AttemptConnectionDisposition {
     ConnectedNew,
     ReusedExisting,
+    /// The message's MX site changed; it was returned to its scheduled queue.
+    MessageReinserted,
+    /// A message-local failure, not a failure of a connection candidate.
+    MessageDeferred(String),
     PeerClosedConnectionNeedNewSession,
     PeerClosedConnectionContinueSession,
 }
@@ -2101,46 +2105,18 @@ impl Dispatcher {
                             Some(ConnectionFailureKind::Other) | None => "",
                         };
 
-                        for msg in dispatcher.msgs.drain(..) {
-                            let response = Response {
-                                code: 400,
-                                enhanced_code: None,
-                                content: format!(
-                                    "KumoMTA internal: \
-                                     failed to connect to any candidate \
-                                     hosts: {summary}{}",
-                                    connection_failures.join(", ")
-                                ),
-                                command: None,
-                            };
-
-                            log_disposition(LogDisposition {
-                                kind: RecordType::TransientFailure,
-                                msg: msg.clone(),
-                                site: &dispatcher.name,
-                                peer_address: None,
-                                response: response.clone(),
-                                egress_pool: Some(&dispatcher.egress_pool),
-                                egress_source: Some(&dispatcher.egress_source.name),
-                                relay_disposition: None,
-                                delivery_protocol: Some(&dispatcher.delivery_protocol),
-                                tls_info: None,
-                                source_address: None,
-                                provider: dispatcher.path_config.borrow().provider_name.as_deref(),
-                                session_id: Some(dispatcher.session_id),
-                                recipient_list: None,
-                            })
-                            .await;
-                            QueueManager::requeue_message(
-                                msg,
-                                IncrementAttempts::Yes,
-                                None,
-                                response,
-                                InsertReason::LoggedTransientFailure.into(),
-                            )
-                            .await?;
-                            dispatcher.metrics.inc_transfail();
-                        }
+                        let response = Response {
+                            code: 400,
+                            enhanced_code: None,
+                            content: format!(
+                                "KumoMTA internal: \
+                                 failed to connect to any candidate \
+                                 hosts: {summary}{}",
+                                connection_failures.join(", ")
+                            ),
+                            command: None,
+                        };
+                        dispatcher.defer_messages(response).await?;
 
                         if consecutive_connection_failures.fetch_add(1, Ordering::SeqCst)
                             > dispatcher
@@ -2162,6 +2138,30 @@ impl Dispatcher {
                     | AttemptConnectionDisposition::ConnectedNew,
                 ) => {
                     // fall through to below logic to do the send
+                }
+                Ok(AttemptConnectionDisposition::MessageDeferred(reason)) => {
+                    dispatcher
+                        .defer_messages(Response {
+                            code: 451,
+                            enhanced_code: Some(EnhancedStatusCode {
+                                class: 4,
+                                subject: 4,
+                                detail: 4,
+                            }),
+                            content: reason,
+                            command: None,
+                        })
+                        .await?;
+                    connection_failures.clear();
+                    connection_failure_classifications.clear();
+                    continue;
+                }
+                Ok(AttemptConnectionDisposition::MessageReinserted) => {
+                    // Only the stale message changed site; keep this queue's
+                    // connection available for its other recipients.
+                    connection_failures.clear();
+                    connection_failure_classifications.clear();
+                    continue;
                 }
                 Ok(AttemptConnectionDisposition::PeerClosedConnectionNeedNewSession) => {
                     tracing::debug!(
@@ -2233,6 +2233,40 @@ impl Dispatcher {
                 }
             }
         }
+    }
+
+    /// Defer only the messages held by this dispatcher. A message-local failure
+    /// must not stun the shared provider queue or consume connection candidates.
+    async fn defer_messages(&mut self, response: Response) -> anyhow::Result<()> {
+        for msg in self.msgs.drain(..) {
+            log_disposition(LogDisposition {
+                kind: RecordType::TransientFailure,
+                msg: msg.clone(),
+                site: &self.name,
+                peer_address: None,
+                response: response.clone(),
+                egress_pool: Some(&self.egress_pool),
+                egress_source: Some(&self.egress_source.name),
+                relay_disposition: None,
+                delivery_protocol: Some(&self.delivery_protocol),
+                tls_info: None,
+                source_address: None,
+                provider: self.path_config.borrow().provider_name.as_deref(),
+                session_id: Some(self.session_id),
+                recipient_list: None,
+            })
+            .await;
+            QueueManager::requeue_message(
+                msg,
+                IncrementAttempts::Yes,
+                None,
+                response.clone(),
+                InsertReason::LoggedTransientFailure.into(),
+            )
+            .await?;
+            self.metrics.inc_transfail();
+        }
+        Ok(())
     }
 
     /// Returns true if we are throttled

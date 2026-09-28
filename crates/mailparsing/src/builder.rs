@@ -202,12 +202,12 @@ mod test {
         b.text_html("<b>this is html 🚀</b>");
         let msg = b.build().unwrap();
         k9::snapshot!(
-            BString::from(msg.to_message_bytes().unwrap()),
+            BString::from(msg.to_message_bytes()),
             r#"
 Content-Type: multipart/alternative;\r
 \tboundary="ma-boundary"\r
 Subject: =?UTF-8?q?Hello_there!_=F0=9F=8D=89?=\r
-MIME-Version: 1.0\r
+Mime-Version: 1.0\r
 Date: Tue, 1 Jul 2003 10:52:37 +0200\r
 \r
 --ma-boundary\r
@@ -252,12 +252,12 @@ Hello World in AMP!
         );
         let msg = b.build().unwrap();
         k9::snapshot!(
-            BString::from(msg.to_message_bytes().unwrap()),
+            BString::from(msg.to_message_bytes()),
             r#"
 Content-Type: multipart/alternative;\r
 \tboundary="ma-boundary"\r
 Subject: =?UTF-8?q?Hello_there!_=F0=9F=8D=89?=\r
-MIME-Version: 1.0\r
+Mime-Version: 1.0\r
 Date: Tue, 1 Jul 2003 10:52:37 +0200\r
 \r
 --ma-boundary\r
@@ -312,12 +312,12 @@ Content-Transfer-Encoding: quoted-printable\r
         .unwrap();
         let msg = b.build().unwrap();
         k9::snapshot!(
-            BString::from(msg.to_message_bytes().unwrap()),
+            BString::from(msg.to_message_bytes()),
             r#"
 Content-Type: multipart/mixed;\r
 \tboundary="mm-boundary"\r
 Subject: =?UTF-8?q?Hello_there!_=F0=9F=8D=89?=\r
-MIME-Version: 1.0\r
+Mime-Version: 1.0\r
 Date: Tue, 1 Jul 2003 10:52:37 +0200\r
 \r
 --mm-boundary\r

@@ -2,23 +2,13 @@ use crate::headermap::{EncodeHeaderValue, HeaderMap};
 use crate::rfc5322_parser::Parser;
 use crate::strings::IntoSharedString;
 use crate::{
-    canonical_header_name, ARCAuthenticationResults, AddressList, AuthenticationResults,
-    MailParsingError, Mailbox, MailboxList, MessageID, MimeParameters, ParsedHeader, Result,
-    SharedString,
+    ARCAuthenticationResults, AddressList, AuthenticationResults, MailParsingError, Mailbox,
+    MailboxList, MessageID, MimeParameters, Result, SharedString,
 };
 use bstr::{BStr, BString};
 use chrono::{DateTime, FixedOffset};
 use std::borrow::Cow;
 use std::str::FromStr;
-
-/// Upper bound on the number of headers accepted from a header block. A parsed
-/// header borrows its name and value from the input rather than copying them,
-/// but each still occupies a fixed-size `Header` struct (~100 bytes) in the
-/// returned list. A block of many minimal lines (`A:\n` is three bytes) expands
-/// to far more resident memory than its size on the wire. The cap bounds that
-/// expansion per block. Real mail stays far below it. A block that exceeds it
-/// is rejected as malformed.
-const MAX_HEADER_COUNT: usize = 1000;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -32,8 +22,6 @@ bitflags::bitflags! {
         const MISSING_MESSAGE_ID_HEADER = 0b0100_0000;
         const MISSING_MIME_VERSION = 0b1000_0000;
         const INVALID_MIME_HEADERS = 0b0001_0000_0000;
-        const MIME_NESTING_LIMIT_EXCEEDED = 0b0010_0000_0000;
-        const MIME_INVALID_BOUNDARY = 0b0100_0000_0000;
     }
 }
 
@@ -87,7 +75,6 @@ pub struct Header<'a> {
 }
 
 /// Holds the result of parsing a block of headers
-#[derive(Debug)]
 pub struct HeaderParseResult<'a> {
     pub headers: HeaderMap<'a>,
     pub body_offset: usize,
@@ -135,7 +122,12 @@ impl<'a> Header<'a> {
     ) -> Self {
         let name = name.into();
         let value = value.into();
-        let value = crate::parsed_header::encode_unstructured_value(value.as_bytes());
+
+        let value: SharedString = match value.to_str() {
+            Ok(value) if value.is_ascii() => kumo_wrap::wrap_bytes(value).into(),
+            Ok(value) => crate::rfc5322_parser::qp_encode(value.as_bytes()).into(),
+            Err(_) => kumo_wrap::wrap_bytes(value.as_bytes()).into(),
+        };
 
         Self {
             name,
@@ -249,11 +241,6 @@ impl<'a> Header<'a> {
             .map_err(MailParsingError::ChronoError)
     }
 
-    /// Parse this header's value using the grammar implied by its name.
-    pub fn structured(&self) -> Result<ParsedHeader> {
-        ParsedHeader::structured(self.name.as_bytes(), self.value.as_bytes())
-    }
-
     pub fn parse_headers<S>(header_block: S) -> Result<HeaderParseResult<'a>>
     where
         S: IntoSharedString<'a>,
@@ -284,11 +271,6 @@ impl<'a> Header<'a> {
                 return Err(MailParsingError::HeaderParse(
                     "header block must not start with spaces".to_string(),
                 ));
-            }
-            if headers.len() >= MAX_HEADER_COUNT {
-                return Err(MailParsingError::HeaderParse(format!(
-                    "header block has more than {MAX_HEADER_COUNT} headers"
-                )));
             }
             let (header, next) = Self::parse(header_block.slice(idx..header_block.len()))?;
             overall_conformance |= header.conformance;
@@ -443,16 +425,61 @@ impl<'a> Header<'a> {
     /// out of spec elements in the rebuilt header
     pub fn rebuild(&self) -> Result<Self> {
         let name = self.get_name();
-        let value = self.structured().map_err(|err| {
+
+        macro_rules! hdr {
+            ($header_name:literal, $func_name:ident, encode) => {
+                if name.eq_ignore_ascii_case($header_name.as_bytes()) {
+                    let value = self.$func_name().map_err(|err| {
+                        MailParsingError::HeaderParse(format!(
+                            "rebuilding '{name}' header: {err:#}"
+                        ))
+                    })?;
+                    return Ok(Self::with_name_value($header_name, value.encode_value()));
+                }
+            };
+            ($header_name:literal, unstructured) => {
+                if name.eq_ignore_ascii_case($header_name.as_bytes()) {
+                    let value = self.as_unstructured().map_err(|err| {
+                        MailParsingError::HeaderParse(format!(
+                            "rebuilding '{name}' header: {err:#}"
+                        ))
+                    })?;
+                    return Ok(Self::new_unstructured($header_name, value));
+                }
+            };
+        }
+
+        hdr!("From", as_mailbox_list, encode);
+        hdr!("Resent-From", as_mailbox_list, encode);
+        hdr!("Reply-To", as_address_list, encode);
+        hdr!("To", as_address_list, encode);
+        hdr!("Cc", as_address_list, encode);
+        hdr!("Bcc", as_address_list, encode);
+        hdr!("Resent-To", as_address_list, encode);
+        hdr!("Resent-Cc", as_address_list, encode);
+        hdr!("Resent-Bcc", as_address_list, encode);
+        hdr!("Date", as_date, encode);
+        hdr!("Sender", as_mailbox, encode);
+        hdr!("Resent-Sender", as_mailbox, encode);
+        hdr!("Message-ID", as_message_id, encode);
+        hdr!("Content-ID", as_content_id, encode);
+        hdr!("Content-Type", as_content_type, encode);
+        hdr!(
+            "Content-Transfer-Encoding",
+            as_content_transfer_encoding,
+            encode
+        );
+        hdr!("Content-Disposition", as_content_disposition, encode);
+        hdr!("References", as_message_id_list, encode);
+        hdr!("Subject", unstructured);
+        hdr!("Comments", unstructured);
+        hdr!("Mime-Version", unstructured);
+
+        // Assume unstructured
+        let value = self.as_unstructured().map_err(|err| {
             MailParsingError::HeaderParse(format!("rebuilding '{name}' header: {err:#}"))
         })?;
-        match canonical_header_name(name) {
-            Some(canonical) => Ok(Self::with_name_value(canonical, value.encode_value())),
-            None => Ok(Self::with_name_value(
-                name.to_string(),
-                value.encode_value(),
-            )),
-        }
+        Ok(Self::new_unstructured(name.to_string(), value))
     }
 }
 
@@ -463,21 +490,6 @@ mod test {
 
     fn assert_static_lifetime(_header: Header<'static>) {
         assert!(true, "I wouldn't compile if this wasn't true");
-    }
-
-    #[test]
-    fn header_count_cap() {
-        // A block at the cap parses. One header beyond it is rejected.
-        let at_cap = "X: y\r\n".repeat(MAX_HEADER_COUNT) + "\r\n";
-        let parsed = Header::parse_headers(at_cap.as_str()).unwrap();
-        k9::assert_equal!(parsed.headers.iter().count(), MAX_HEADER_COUNT);
-
-        let over_cap = "X: y\r\n".repeat(MAX_HEADER_COUNT + 1) + "\r\n";
-        let err = Header::parse_headers(over_cap.as_str()).unwrap_err();
-        k9::assert_equal!(
-            err.to_string(),
-            "invalid header: header block has more than 1000 headers"
-        );
     }
 
     #[test]
@@ -651,25 +663,6 @@ Ok(
     }
 
     #[test]
-    fn test_rebuild_authentication_results() {
-        // Authentication-Results is parsed and re-encoded like other
-        // structured headers, which canonicalizes the name and drops the
-        // CFWS comment.
-        let header = Header::with_name_value(
-            "authentication-results",
-            "example.com;\n\tdkim=pass (good signature) header.d=example.com",
-        );
-        let rebuilt = header.rebuild().unwrap();
-        k9::assert_equal!(rebuilt.get_name(), "Authentication-Results");
-        rebuilt.as_authentication_results().unwrap();
-        assert!(
-            !rebuilt.get_raw_value().contains(&b'('),
-            "comment should be dropped by structured re-encode: {:?}",
-            rebuilt.get_raw_value()
-        );
-    }
-
-    #[test]
     fn test_unstructured_encode() {
         let header = Header::new_unstructured("Subject", "hello there");
         k9::snapshot!(header.value, "hello there");
@@ -801,11 +794,10 @@ Some(
         k9::assert_equal!(
             MessageConformance::from_str("LINE_TOO_LONG|spoon").unwrap_err(),
             "invalid MessageConformance flag 'spoon', possible values are \
-            'INVALID_MIME_HEADERS', 'LINE_TOO_LONG', 'MIME_INVALID_BOUNDARY', \
-            'MIME_NESTING_LIMIT_EXCEEDED', 'MISSING_COLON_VALUE', 'MISSING_DATE_HEADER', \
-            'MISSING_MESSAGE_ID_HEADER', \
-            'MISSING_MIME_VERSION', 'NAME_ENDS_WITH_SPACE', 'NEEDS_TRANSFER_ENCODING', \
-            'NON_CANONICAL_LINE_ENDINGS'"
+            'INVALID_MIME_HEADERS', \
+            'LINE_TOO_LONG', 'MISSING_COLON_VALUE', 'MISSING_DATE_HEADER', \
+            'MISSING_MESSAGE_ID_HEADER', 'MISSING_MIME_VERSION', 'NAME_ENDS_WITH_SPACE', \
+            'NEEDS_TRANSFER_ENCODING', 'NON_CANONICAL_LINE_ENDINGS'"
         );
     }
 
