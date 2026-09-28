@@ -1735,6 +1735,12 @@ impl Queue {
             return Ok(());
         }
 
+        if context.contains(InsertReason::MxSiteChanged) {
+            // The dispatcher's MX cache can refresh before our routing cache
+            // expires. Do not promote this message back through the old site.
+            self.source_selector.load().invalidate_ready_queue_names();
+        }
+
         match self.insert_delayed(msg.clone(), context.clone()).await? {
             InsertResult::Delayed => Ok(()),
             InsertResult::Ready(msg) => {

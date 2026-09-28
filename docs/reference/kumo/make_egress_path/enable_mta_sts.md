@@ -37,9 +37,8 @@ The `mode` field describes the intended policy of the destination site, while
 the `mx` fields place restrictions on the allowable list of MX hosts.
 
 If the `mode` for the destination domain is set to `"enforce"`, then the
-connection will be made with `enable_tls="Required"`. Candidate MX hosts that do
-not match the `mx` fields are removed during resolution, so by the time a
-connection is attempted the candidate set already satisfies the policy.
+connection will be made with `enable_tls="Required"`. MX hosts that do not match
+the `mx` fields are removed from the domain's effective MX set during resolution.
 
 If the `mode` is set to `"testing"`, then the connection will be made
 with `enable_tls="OpportunisticInsecure"`.
@@ -52,11 +51,20 @@ supersedes the MTA-STS TLS posture. Unusable TLSA records still require STARTTLS
 MTA-STS may add certificate validation but cannot relax that requirement. The MX
 host filtering performed during resolution is independent of this TLS precedence.
 
-The dispatcher applies the routing domain's effective TLS requirement to each
-message, including when domains share an MX ready queue. It reuses a connection
-only when that connection satisfies the requirement. DANE decisions are reused
-only within the same unexpired domain/MX context; a change requires a fresh
-connection-time evaluation.
+For DNS-MX delivery, the dispatcher checks each message's routing-domain context
+when either `enable_mta_sts` or `enable_dane` is enabled, including when domains
+share a ready queue. It checks that the selected MX belongs to that message's
+effective MX set before connecting or reusing a connection. The egress-path
+configuration, including the configured `enable_tls` and feature switches,
+remains shared by the ready queue; these checks do not isolate arbitrary
+per-domain egress settings.
+
+Connection reuse must satisfy the message's effective TLS requirement. A
+`testing` message attempts advertised STARTTLS if the existing connection
+skipped TLS because it was disabled, but preserves an allowed opportunistic
+plaintext fallback. DANE evaluation is independent of `enable_mta_sts`; see
+[DANE connection reuse](enable_dane.md#connection-reuse). These per-message DNS-MX
+checks do not change explicit `mx_list` routing or its operator-configured trust.
 
 A policy-driven reconnect does not itself reinsert other ready messages, but it
 still observes the site's shared connection-rate limits and failure backoff.

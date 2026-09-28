@@ -508,15 +508,22 @@ enum QueuedPolicyChange {
     RequirePkix,
     ExpirePolicy,
     ChangeSite,
+    EvictedSite,
 }
 
 /// Keep one delivery in DATA while other messages accumulate on its ready
 /// queue. Policy updates then exercise the dispatcher, not just promotion.
 async fn queued_policy_change(change: QueuedPolicyChange) -> anyhow::Result<()> {
     let control = tempfile::tempdir()?;
-    let site_change = change == QueuedPolicyChange::ChangeSite;
+    let site_change = matches!(
+        change,
+        QueuedPolicyChange::ChangeSite | QueuedPolicyChange::EvictedSite
+    );
     let delivers = site_change || change == QueuedPolicyChange::RequirePkix;
     let (_ca, mut options) = trusted_sink(&["mail.shared.example.com", "mail.other.example.com"])?;
+    if change == QueuedPolicyChange::EvictedSite {
+        options = options.env("KUMOD_MTA_STS_EVICT_MX", "1");
+    }
     if delivers {
         // Leave the initial TLS connection unverified, so the moved message
         // must authenticate independently under its new enforcing policy.
@@ -555,7 +562,9 @@ async fn queued_policy_change(change: QueuedPolicyChange) -> anyhow::Result<()> 
     send(&mut client, sibling).await?;
     if matches!(
         change,
-        QueuedPolicyChange::ExpirePolicy | QueuedPolicyChange::ChangeSite
+        QueuedPolicyChange::ExpirePolicy
+            | QueuedPolicyChange::ChangeSite
+            | QueuedPolicyChange::EvictedSite
     ) {
         let (domain, host) = if site_change {
             ("transition.example.com", "mail.other.example.com")
@@ -568,8 +577,10 @@ async fn queued_policy_change(change: QueuedPolicyChange) -> anyhow::Result<()> 
             &format!("version: STSv1\nmode: enforce\nmx: {host}\nmax_age: 86400"),
         )
         .await?;
-        // The initial policy snapshot expires after one second.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if change != QueuedPolicyChange::EvictedSite {
+            // The initial policy snapshot expires after one second.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
     std::fs::write(control.path().join("release"), "")?;
     anyhow::ensure!(
@@ -824,9 +835,13 @@ async fn mta_sts_reuses_pkix_when_dane_absent() -> anyhow::Result<()> {
     reuse_validated_session("openssl", Some("absent"), false).await
 }
 
-#[tokio::test]
-async fn mta_sts_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
+async fn pkix_proof_does_not_bypass_dane(no_sts: bool, secure_creator: bool) -> anyhow::Result<()> {
     let (_ca, options) = trusted_sink(&["mail.shared.example.com"])?;
+    let options = if no_sts {
+        options.env("KUMOD_MTA_STS_NO_STS", "1")
+    } else {
+        options
+    };
     let mut daemon = options
         .env("KUMOD_MTA_STS_DANE", "mismatch")
         .env("KUMOD_MTA_STS_NO_RETRY", "1")
@@ -835,15 +850,17 @@ async fn mta_sts_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
     let mut client = daemon.smtp_client().await?;
     // A secure creator used to make all new connections apply DANE. Per-message
     // selection must not let a later PKIX connection bypass that requirement.
-    send(&mut client, "first@enforce.example.com").await?;
-    anyhow::ensure!(
-        daemon
-            .wait_for_source_summary(
-                |s| s.get(&TransientFailure).copied().unwrap_or(0) > 0,
-                Duration::from_secs(10)
-            )
-            .await
-    );
+    if secure_creator {
+        send(&mut client, "first@enforce.example.com").await?;
+        anyhow::ensure!(
+            daemon
+                .wait_for_source_summary(
+                    |s| s.get(&TransientFailure).copied().unwrap_or(0) > 0,
+                    Duration::from_secs(10)
+                )
+                .await
+        );
+    }
     send(&mut client, "middle@pkix.example.com").await?;
     anyhow::ensure!(
         daemon
@@ -854,7 +871,7 @@ async fn mta_sts_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
     anyhow::ensure!(
         daemon
             .wait_for_source_summary(
-                |s| s.get(&TransientFailure).copied().unwrap_or(0) > 1
+                |s| s.get(&TransientFailure).copied().unwrap_or(0) > usize::from(secure_creator)
                     || s.get(&Delivery).copied().unwrap_or(0) > 1,
                 Duration::from_secs(10)
             )
@@ -872,6 +889,23 @@ async fn mta_sts_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
     );
     anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 1);
     Ok(())
+}
+
+#[tokio::test]
+async fn mta_sts_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
+    pkix_proof_does_not_bypass_dane(false, true).await
+}
+#[tokio::test]
+async fn mta_sts_disabled_pkix_proof_does_not_bypass_dane() -> anyhow::Result<()> {
+    pkix_proof_does_not_bypass_dane(true, true).await
+}
+#[tokio::test]
+async fn mta_sts_dane_checks_unsigned_creator() -> anyhow::Result<()> {
+    pkix_proof_does_not_bypass_dane(false, false).await
+}
+#[tokio::test]
+async fn mta_sts_disabled_dane_checks_unsigned_creator() -> anyhow::Result<()> {
+    pkix_proof_does_not_bypass_dane(true, false).await
 }
 
 async fn testing_then_none(tls: &str, hide_starttls: bool) -> anyhow::Result<()> {
@@ -1032,4 +1066,344 @@ async fn mta_sts_policy_reconnect_observes_shared_connection_rate() -> anyhow::R
 #[tokio::test]
 async fn mta_sts_policy_failures_observe_shared_backoff() -> anyhow::Result<()> {
     shared_queue_limits("backoff").await
+}
+
+#[tokio::test]
+async fn mta_sts_site_change_after_cache_eviction() -> anyhow::Result<()> {
+    queued_policy_change(QueuedPolicyChange::EvictedSite).await
+}
+
+#[tokio::test]
+async fn mta_sts_none_disabled_to_testing_attempts_tls() -> anyhow::Result<()> {
+    let mut daemon = DaemonWithMaildirOptions::new()
+        .policy_file("mta-sts.lua")
+        .env("KUMOD_MTA_STS_TLS", "Disabled")
+        .start()
+        .await?;
+    let mut client = daemon.smtp_client().await?;
+    send(&mut client, "first@none.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await
+    );
+    send(&mut client, "second@testing.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(2, Duration::from_secs(10))
+            .await
+    );
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    for (recipient, tls) in [
+        ("first@none.example.com", false),
+        ("second@testing.example.com", true),
+    ] {
+        anyhow::ensure!(
+            records.iter().any(|r| r.kind == Delivery
+                && r.recipient.iter().any(|addr| addr == recipient)
+                && r.tls_cipher.is_some() == tls
+                && r.num_attempts == 0),
+            "{records:?}"
+        );
+    }
+    Ok(())
+}
+
+async fn assert_same_sink_connection(
+    daemon: &crate::kumod::DaemonWithMaildir,
+) -> anyhow::Result<()> {
+    let records = daemon.sink.collect_logs().await?;
+    let sessions: Vec<_> = records
+        .iter()
+        .filter(|r| r.kind == kumo_log_types::RecordType::Reception)
+        .map(|r| r.session_id)
+        .collect();
+    anyhow::ensure!(
+        sessions.len() >= 2 && sessions[0].is_some() && sessions.iter().all(|s| s == &sessions[0]),
+        "connection was not reused: {sessions:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn mta_sts_testing_preserves_plaintext_fallback() -> anyhow::Result<()> {
+    let mut daemon = DaemonWithMaildirOptions::new()
+        .policy_file("mta-sts.lua")
+        .env("KUMOD_MTA_STS_FALLBACK", "1")
+        .start()
+        .await?;
+    let mut client = daemon.smtp_client().await?;
+    for (index, recipient) in ["first@none.example.com", "second@testing.example.com"]
+        .into_iter()
+        .enumerate()
+    {
+        send(&mut client, recipient).await?;
+        anyhow::ensure!(
+            daemon
+                .wait_for_maildir_count(index + 1, Duration::from_secs(10))
+                .await
+        );
+    }
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    anyhow::ensure!(records
+        .iter()
+        .filter(|r| r.kind == Delivery)
+        .all(|r| r.tls_cipher.is_none()));
+    assert_same_sink_connection(&daemon).await
+}
+
+#[tokio::test]
+async fn mta_sts_peer_close_precedes_policy_reconnect() -> anyhow::Result<()> {
+    let (_ca, options) = trusted_sink(&["mail.shared.example.com", "mail.backup.example.com"])?;
+    let mut daemon = options
+        .env("KUMOD_MTA_STS_BACKUP", "1")
+        .env("KUMOD_UNTRUSTED_MTA_STS_TLS", "1")
+        .start()
+        .await?;
+    let mut client = daemon.smtp_client().await?;
+    send(&mut client, "first@none.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await
+    );
+    // The sink sends 421 after 3s idle; the source's idle timeout is 10s.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    send(&mut client, "second@enforce.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(2, Duration::from_secs(10))
+            .await
+    );
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    for (recipient, host) in [
+        ("first@none.example.com", "mail.shared.example.com."),
+        ("second@enforce.example.com", "mail.backup.example.com."),
+    ] {
+        let record = records
+            .iter()
+            .find(|r| r.kind == Delivery && r.recipient.iter().any(|addr| addr == recipient))
+            .context("delivery")?;
+        anyhow::ensure!(
+            record.peer_address.as_ref().is_some_and(|p| p.name == host)
+                && record.num_attempts == 0,
+            "reconnect strategy bypassed: {record:?}"
+        );
+    }
+    Ok(())
+}
+
+async fn reuse_dane_across_domains(mode: &str, no_sts: bool, refresh: bool) -> anyhow::Result<()> {
+    let control = tempfile::tempdir()?;
+    let (_ca, mut options) = trusted_sink(&[if mode == "absent" {
+        "mail.shared.example.com"
+    } else {
+        "not-the-mx.example.com"
+    }])?;
+    options = options
+        .env("KUMOD_MTA_STS_DANE", mode)
+        .env("KUMOD_MTA_STS_TLS", "Required");
+    if no_sts {
+        options = options.env("KUMOD_MTA_STS_NO_STS", "1");
+    }
+    if refresh {
+        options = options.env("KUMOD_MTA_STS_SHORT_DANE_MX", "1").env(
+            "KUMOD_MTA_STS_CONTROL",
+            control.path().display().to_string(),
+        );
+    }
+    let mut daemon = options.start().await?;
+    let mut client = daemon.smtp_client().await?;
+    for (index, recipient) in [
+        "first@enforce.example.com",
+        "second@secure.example.com",
+        "third@enforce.example.com",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if refresh && index > 0 {
+            update_dane(control.path(), mode).await?;
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        }
+        send(&mut client, recipient).await?;
+        anyhow::ensure!(
+            daemon
+                .wait_for_maildir_count(index + 1, Duration::from_secs(10))
+                .await
+        );
+    }
+    if refresh {
+        std::fs::write(control.path().join("stop"), "")?;
+    }
+    daemon.stop_both().await?;
+    assert_same_sink_connection(&daemon).await
+}
+
+#[tokio::test]
+async fn mta_sts_dane_reuses_across_domains() -> anyhow::Result<()> {
+    reuse_dane_across_domains("matching", false, false).await
+}
+#[tokio::test]
+async fn mta_sts_disabled_dane_reuses_across_domains() -> anyhow::Result<()> {
+    reuse_dane_across_domains("matching", true, false).await
+}
+#[tokio::test]
+async fn mta_sts_dane_absence_reuses_across_domains() -> anyhow::Result<()> {
+    reuse_dane_across_domains("absent", false, false).await
+}
+#[tokio::test]
+async fn mta_sts_dane_unusable_reuses_across_domains() -> anyhow::Result<()> {
+    reuse_dane_across_domains("unusable", false, false).await
+}
+#[tokio::test]
+async fn mta_sts_dane_refresh_identical_records_reuses() -> anyhow::Result<()> {
+    reuse_dane_across_domains("matching", false, true).await
+}
+
+async fn update_dane(control: &Path, mode: &str) -> anyhow::Result<()> {
+    let ack = control.join("dane-applied");
+    if ack.exists() {
+        std::fs::remove_file(&ack)?;
+    }
+    std::fs::write(control.join("dane-mode.tmp"), mode)?;
+    std::fs::rename(control.join("dane-mode.tmp"), control.join("dane-mode"))?;
+    wait_file(&ack).await
+}
+
+async fn dane_policy_transition(
+    initial: &str,
+    next: &str,
+    expect_delivery: bool,
+) -> anyhow::Result<()> {
+    let control = tempfile::tempdir()?;
+    let (_ca, options) = trusted_sink(&["mail.shared.example.com"])?;
+    let mut daemon = options
+        .env("KUMOD_MTA_STS_DANE", initial)
+        .env("KUMOD_MTA_STS_NO_STS", "1")
+        .env("KUMOD_MTA_STS_TLS", "Disabled")
+        .env("KUMOD_MTA_STS_NO_RETRY", "1")
+        .env(
+            "KUMOD_MTA_STS_CONTROL",
+            control.path().display().to_string(),
+        )
+        .start()
+        .await?;
+    let mut client = daemon.smtp_client().await?;
+    send(&mut client, "first@enforce.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await
+    );
+    update_dane(control.path(), next).await?;
+    send(&mut client, "second@enforce.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_source_summary(
+                |s| s.get(&Delivery).copied().unwrap_or(0) > 1
+                    || s.get(&TransientFailure).copied().unwrap_or(0) > 0,
+                Duration::from_secs(10)
+            )
+            .await
+    );
+    std::fs::write(control.path().join("stop"), "")?;
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    let second = records
+        .iter()
+        .find(|r| {
+            matches!(r.kind, Delivery | TransientFailure)
+                && r.recipient
+                    .iter()
+                    .any(|addr| addr == "second@enforce.example.com")
+        })
+        .context("second result")?;
+    anyhow::ensure!(
+        second.kind
+            == if expect_delivery {
+                Delivery
+            } else {
+                TransientFailure
+            },
+        "{initial} → {next}: {second:?}"
+    );
+    if expect_delivery {
+        anyhow::ensure!(second.tls_cipher.is_some());
+    }
+    anyhow::ensure!(
+        daemon.extract_maildir_messages()?.len() == if expect_delivery { 2 } else { 1 }
+    );
+    Ok(())
+}
+#[tokio::test]
+async fn mta_sts_disabled_dane_rechecks_changed_records() -> anyhow::Result<()> {
+    dane_policy_transition("matching", "mismatch", false).await
+}
+#[tokio::test]
+async fn mta_sts_disabled_dane_rechecks_temporary_failure() -> anyhow::Result<()> {
+    dane_policy_transition("matching", "servfail", false).await
+}
+#[tokio::test]
+async fn mta_sts_disabled_dane_upgrades_plaintext() -> anyhow::Result<()> {
+    dane_policy_transition("absent", "matching", true).await
+}
+#[tokio::test]
+async fn mta_sts_disabled_dane_unusable_requires_encryption() -> anyhow::Result<()> {
+    dane_policy_transition("absent", "unusable", true).await
+}
+
+#[tokio::test]
+async fn mta_sts_site_collision_does_not_authorize_other_hosts() -> anyhow::Result<()> {
+    let (_ca, options) = trusted_sink(&["b.x.targets.test", "c.y.targets.test"])?;
+    let mut daemon = options
+        .env("KUMOD_MTA_STS_COLLISION", "1")
+        .env("KUMOD_MTA_STS_NO_RETRY", "1")
+        .start()
+        .await?;
+    let mut client = daemon.smtp_client().await?;
+    send(&mut client, "first@collision-a.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await
+    );
+    send(&mut client, "second@collision-b.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_source_summary(
+                |s| s.get(&Delivery).copied().unwrap_or(0) > 1
+                    || s.get(&TransientFailure).copied().unwrap_or(0) > 0,
+                Duration::from_secs(10)
+            )
+            .await
+    );
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    let first = records
+        .iter()
+        .find(|r| r.kind == Delivery)
+        .context("first delivery")?;
+    let second = records
+        .iter()
+        .find(|r| {
+            matches!(r.kind, Delivery | TransientFailure)
+                && r.recipient
+                    .iter()
+                    .any(|addr| addr == "second@collision-b.example.com")
+        })
+        .context("second result")?;
+    anyhow::ensure!(
+        first.site == second.site,
+        "fixture must collide: {first:?} {second:?}"
+    );
+    anyhow::ensure!(
+        second.kind == TransientFailure,
+        "used an unauthorized MX: {second:?}"
+    );
+    anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 1);
+    Ok(())
 }

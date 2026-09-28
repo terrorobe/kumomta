@@ -24,6 +24,10 @@ max_age: 86400]],
 mode: testing
 mx: mail.shared.example.com
 max_age: 86400]],
+  ['secure.example.com'] = [[version: STSv1
+mode: enforce
+mx: mail.shared.example.com
+max_age: 86400]],
   ['pkix.example.com'] = [[version: STSv1
 mode: enforce
 mx: mail.shared.example.com
@@ -35,6 +39,63 @@ max_age: 1]],
 
 if CONTROL then
   sts_policies['none.example.com'] = 'version: STSv1\nmode: none\nmax_age: 1'
+end
+if os.getenv 'KUMOD_MTA_STS_EVICT_MX' then
+  for _, domain in ipairs { 'none.example.com', 'transition.example.com' } do
+    sts_policies[domain] = 'version: STSv1\nmode: none\nmax_age: 86400'
+  end
+end
+if os.getenv 'KUMOD_MTA_STS_SHORT_DANE_MX' then
+  for _, domain in ipairs { 'enforce.example.com', 'secure.example.com' } do
+    sts_policies[domain] =
+      sts_policies[domain]:gsub('max_age: 86400', 'max_age: 1')
+  end
+end
+
+local function configure_dane(mode)
+  local cert = assert(os.getenv 'KUMOD_SINK_TLS_CERT')
+  local der = kumo.encode.base64_decode(
+    cert
+      :gsub('%-%-%-%-%-BEGIN CERTIFICATE%-%-%-%-%-', '')
+      :gsub('%-%-%-%-%-END CERTIFICATE%-%-%-%-%-', '')
+      :gsub('%s', '')
+  )
+  local tlsa = '3 0 0 ' .. kumo.encode.hex_encode(der)
+  if mode == 'mismatch' then
+    tlsa = '3 0 1 ' .. string.rep('00', 32)
+  elseif mode == 'unusable' then
+    tlsa = '1 0 0 ' .. kumo.encode.hex_encode(der)
+  elseif mode == 'absent' then
+    tlsa = nil
+  end
+  kumo.dns.configure_test_resolver {
+    servfail = mode == 'servfail' and {
+      '_' .. SINK_PORT .. '._tcp.mail.shared.example.com',
+    } or nil,
+    zones = {
+      {
+        zone = '$ORIGIN enforce.example.com.\n@ 600 MX 10 mail.shared.example.com.\n',
+        secure = true,
+      },
+      {
+        zone = '$ORIGIN secure.example.com.\n@ 600 MX 10 mail.shared.example.com.\n',
+        secure = true,
+      },
+      {
+        zone = '$ORIGIN pkix.example.com.\n@ 600 MX 10 mail.shared.example.com.\n',
+        secure = false,
+      },
+      {
+        zone = '$ORIGIN shared.example.com.\nmail 600 A 127.0.0.1\n'
+          .. (
+            tlsa
+              and ('_' .. SINK_PORT .. '._tcp.mail 600 TLSA ' .. tlsa .. '\n')
+            or ''
+          ),
+        secure = true,
+      },
+    },
+  }
 end
 
 -- Test-only control channel: change policies after messages are in the ready
@@ -54,8 +115,26 @@ kumo.on('test.update_sts', function()
         sts_policies[domain] = policy
       end
       kumo.dns.configure_test_mta_sts(sts_policies)
+      if os.getenv 'KUMOD_MTA_STS_EVICT_MX' then
+        -- Evict MX_CACHE without expiring the source selector's cached route.
+        -- LRU eviction retains the newest entry even at capacity zero. Insert
+        -- a newer, unrelated entry so the affected domain is evictable.
+        kumo.set_lruttl_cache_capacity('dns_resolver_mx', 1)
+        kumo.dns.lookup_mx 'evict.example.com'
+        kumo.set_lruttl_cache_capacity('dns_resolver_mx', 1)
+        kumo.set_lruttl_cache_capacity('dns_resolver_mx', 65536)
+      end
       os.remove(CONTROL .. '/policies.json')
       local ack = assert(io.open(CONTROL .. '/applied', 'w'))
+      ack:close()
+    end
+    local dane = io.open(CONTROL .. '/dane-mode')
+    if dane then
+      local mode = dane:read '*a'
+      dane:close()
+      configure_dane(mode)
+      os.remove(CONTROL .. '/dane-mode')
+      local ack = assert(io.open(CONTROL .. '/dane-applied', 'w'))
       ack:close()
     end
     kumo.time.sleep(0.05)
@@ -115,6 +194,10 @@ $ORIGIN testing.example.com.
 @ 600 MX 10 mail.shared.example.com.
 ]],
     [[
+$ORIGIN evict.example.com.
+@ 600 MX 10 mail.shared.example.com.
+]],
+    [[
 $ORIGIN sibling.example.com.
 @ 600 MX 10 mail.shared.example.com.
 ]],
@@ -144,45 +227,41 @@ mail 600 A 127.0.0.1
 ]],
   }
 
-  if os.getenv 'KUMOD_MTA_STS_DANE' then
-    local cert = assert(os.getenv 'KUMOD_SINK_TLS_CERT')
-    local der = kumo.encode.base64_decode(
-      cert
-        :gsub('%-%-%-%-%-BEGIN CERTIFICATE%-%-%-%-%-', '')
-        :gsub('%-%-%-%-%-END CERTIFICATE%-%-%-%-%-', '')
-        :gsub('%s', '')
-    )
-    local tlsa = '3 0 0 ' .. kumo.encode.hex_encode(der)
-    if os.getenv 'KUMOD_MTA_STS_DANE' == 'mismatch' then
-      tlsa = '3 0 1 ' .. string.rep('00', 32)
-    elseif os.getenv 'KUMOD_MTA_STS_DANE' == 'unusable' then
-      tlsa = '1 0 0 ' .. kumo.encode.hex_encode(der)
-      sts_policies['enforce.example.com'] =
-        'version: STSv1\nmode: none\nmax_age: 86400'
-    elseif os.getenv 'KUMOD_MTA_STS_DANE' == 'absent' then
-      tlsa = nil
-    end
+  if os.getenv 'KUMOD_MTA_STS_BACKUP' then
     kumo.dns.configure_test_resolver {
-      zones = {
-        {
-          zone = '$ORIGIN enforce.example.com.\n@ 600 MX 10 mail.shared.example.com.\n',
-          secure = true,
-        },
-        {
-          zone = '$ORIGIN pkix.example.com.\n@ 600 MX 10 mail.shared.example.com.\n',
-          secure = false,
-        },
-        {
-          zone = '$ORIGIN shared.example.com.\nmail 600 A 127.0.0.1\n'
-            .. (
-              tlsa
-                and ('_' .. SINK_PORT .. '._tcp.mail 600 TLSA ' .. tlsa .. '\n')
-              or ''
-            ),
-          secure = true,
-        },
-      },
+      '$ORIGIN none.example.com.\n@ 600 MX 10 mail.shared.example.com.\n@ 600 MX 20 mail.backup.example.com.\n',
+      '$ORIGIN enforce.example.com.\n@ 600 MX 10 mail.shared.example.com.\n@ 600 MX 20 mail.backup.example.com.\n',
+      '$ORIGIN shared.example.com.\nmail 600 A 127.0.0.1\n',
+      '$ORIGIN backup.example.com.\nmail 600 A 127.0.0.1\n',
     }
+    sts_policies['enforce.example.com'] = [[version: STSv1
+mode: enforce
+mx: mail.shared.example.com
+mx: mail.backup.example.com
+max_age: 86400]]
+  end
+  if os.getenv 'KUMOD_MTA_STS_COLLISION' then
+    kumo.dns.configure_test_resolver {
+      '$ORIGIN collision-a.example.com.\n@ 600 MX 10 a.x.targets.test.\n@ 600 MX 10 b.x.targets.test.\n@ 600 MX 10 c.y.targets.test.\n',
+      '$ORIGIN collision-b.example.com.\n@ 600 MX 10 a.x.targets.test.\n@ 600 MX 10 b.y.targets.test.\n@ 600 MX 10 c.x.targets.test.\n',
+      '$ORIGIN targets.test.\na.x 600 A 127.0.0.2\nb.x 600 A 127.0.0.1\nc.y 600 A 127.0.0.1\nb.y 600 A 127.0.0.1\nc.x 600 A 127.0.0.1\n',
+    }
+    sts_policies['collision-a.example.com'] =
+      'version: STSv1\nmode: none\nmax_age: 86400'
+    sts_policies['collision-b.example.com'] = [[version: STSv1
+mode: enforce
+mx: a.x.targets.test
+mx: b.y.targets.test
+mx: c.x.targets.test
+max_age: 86400]]
+  end
+  if os.getenv 'KUMOD_MTA_STS_DANE' then
+    configure_dane(os.getenv 'KUMOD_MTA_STS_DANE')
+    if os.getenv 'KUMOD_MTA_STS_DANE' == 'unusable' then
+      for _, domain in ipairs { 'enforce.example.com', 'secure.example.com' } do
+        sts_policies[domain] = 'version: STSv1\nmode: none\nmax_age: 86400'
+      end
+    end
   end
   kumo.dns.configure_test_mta_sts(sts_policies)
   if CONTROL then
@@ -224,6 +303,9 @@ max_age: 86400]]
   local shared = domain == 'none.example.com'
     or domain == 'enforce.example.com'
     or domain == 'pkix.example.com'
+    or domain == 'secure.example.com'
+    or domain == 'collision-a.example.com'
+    or domain == 'collision-b.example.com'
     or domain == 'testing.example.com'
     or domain == 'transition.example.com'
     or domain == 'sibling.example.com'
@@ -236,7 +318,17 @@ max_age: 86400]]
         or 'OpportunisticInsecure'
       ),
     prohibited_hosts = {},
+    -- Exclude the colliding sets' common host so the connected peer belongs
+    -- only to the creator's set; do not rely on an OS-specific connect failure.
+    skip_hosts = os.getenv 'KUMOD_MTA_STS_COLLISION' and { '127.0.0.2' }
+      or nil,
     connection_limit = 1,
+    reconnect_strategy = os.getenv 'KUMOD_MTA_STS_BACKUP'
+        and 'ConnectNextHost'
+      or nil,
+    idle_timeout = os.getenv 'KUMOD_MTA_STS_BACKUP' and '10s' or nil,
+    opportunistic_tls_reconnect_on_failed_handshake = os.getenv 'KUMOD_MTA_STS_FALLBACK'
+      ~= nil,
     consecutive_connection_failures_before_delay = os.getenv 'KUMOD_MTA_STS_LIMIT'
           == 'backoff'
         and 0
@@ -247,7 +339,7 @@ max_age: 86400]]
     smtp_port = SINK_PORT,
     -- Keep the existing MX-filtering tests focused on resolution. The shared
     -- MX test applies each domain's resolved policy at connection setup.
-    enable_mta_sts = shared,
+    enable_mta_sts = shared and not os.getenv 'KUMOD_MTA_STS_NO_STS',
     enable_dane = os.getenv 'KUMOD_MTA_STS_DANE' ~= nil,
     tls_prefer_openssl = shared
       and os.getenv 'KUMOD_SINK_TLS_CERT' ~= nil
@@ -266,5 +358,9 @@ end)
 -- Count promotions so queue-continuity tests detect bulk re-insertion, not
 -- merely eventual delivery of the unrelated messages.
 kumo.on('throttle_insert_ready_queue', function(msg)
-  msg:set_meta('promotions', (msg:get_meta 'promotions' or 0) + 1)
+  local promotions = (msg:get_meta 'promotions' or 0) + 1
+  msg:set_meta('promotions', promotions)
+  if os.getenv 'KUMOD_MTA_STS_EVICT_MX' then
+    assert(promotions <= 4, 'site-change reinsertion loop')
+  end
 end)

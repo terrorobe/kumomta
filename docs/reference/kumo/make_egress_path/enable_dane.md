@@ -27,8 +27,9 @@ DANE-eligible (there is no name to query).
 
 Notes:
 
-* When usable DANE records are found (the `Required` row), MTA-STS is **not**
-  consulted; DANE authentication wins. When records are published but none are
+* When usable DANE records are found (the `Required` row), DANE authentication
+  overrides the MTA-STS **TLS posture**. MTA-STS MX filtering during resolution
+  is independent of that precedence. When records are published but none are
   usable (the `RequiredInsecure` row) the domain has no usable DANE policy, so
   MTA-STS may still be consulted to add authentication — but it cannot relax the
   mandatory STARTTLS.
@@ -165,3 +166,25 @@ unattended long-term currency, point the unbound backend at an RFC 5011 managed
 anchor file, which is maintained automatically across rollovers. See
 [trust_anchor_file](../../kumo.dns/resolver_options/trust_anchor_file.md) for the
 static and managed forms and their tradeoffs.
+
+## Connection reuse
+
+For DNS-MX delivery, DANE eligibility uses each message's routing-domain DNSSEC
+context, even when domains share a ready queue or `enable_mta_sts` is false.
+The selected MX must belong to that message's effective MX set. Explicit
+`mx_list` routing continues to use `treat_mx_list_as_secure` and the resolved
+address's security status for its connection-time DANE decision.
+
+For an existing DNS-MX connection, the dispatcher obtains the current DANE result
+for its MX hostname and actual destination port through the configured resolver,
+which can use its DNS cache. Successful DANE authentication records the normalized
+TLSA set used by the handshake. An identical current TLSA set permits reuse across
+domains and after DNS refresh without another handshake. A different set requires
+fresh authentication, even if the existing certificate might also match it.
+A PKIX-validated connection alone is not evidence of DANE authentication.
+
+Absent or unusable TLSA records use the effective TLS posture in the table above,
+including any applicable MTA-STS override. A temporary or bogus lookup result
+defers the message rather than reusing an older DANE decision or downgrading to
+PKIX or plaintext. Policy decisions are snapshots for a message's delivery
+attempt, not a permanent property of the ready queue or connection.

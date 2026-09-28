@@ -213,7 +213,8 @@ fn classify_tlsa_answer(mx_host: &str, port: u16, answer: Result<Answer, DnsErro
         )
     });
 
-    tracing::info!("resolve_dane {mx_host}:{port} usable TLSA records: {usable:?}");
+    usable.dedup();
+    tracing::debug!("resolve_dane {mx_host}:{port} usable TLSA records: {usable:?}");
 
     DaneStatus::Records(usable)
 }
@@ -851,6 +852,27 @@ mod test {
             Matching::Raw,
             vec![0u8; 100]
         )));
+    }
+
+    #[test]
+    fn tlsa_answer_normalization() {
+        let first = sha256_tlsa(CertUsage::DaneTa, Selector::Full);
+        let second = dane_ee_record();
+        let classify = |records: Vec<TLSA>| {
+            classify_tlsa_answer(
+                "mx.example.com",
+                25,
+                Ok(answer(
+                    records.into_iter().map(RData::TLSA).collect(),
+                    true,
+                    ResponseCode::NoError,
+                )),
+            )
+        };
+        assert_eq!(
+            classify(vec![second.clone(), first.clone(), second.clone()]),
+            classify(vec![first, second])
+        );
     }
 
     #[test]
