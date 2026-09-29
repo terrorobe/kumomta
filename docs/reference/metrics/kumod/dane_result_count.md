@@ -14,20 +14,25 @@ Number of DANE policy decisions made on the SMTP delivery path, labelled by `res
 
 The `result` label is one of:
 
-  * `ok`: usable DANE-TA(2)/DANE-EE(3) TLSA records were found; the peer
-    certificate is checked against them.
+  * `ok`: usable DANE-TA(2)/DANE-EE(3) TLSA records were found; DANE
+    authentication is required, via a handshake or matching session evidence.
+    This is not a count of successful handshakes or deliveries.
   * `unusable`: TLSA records were published but none are usable; STARTTLS is
-    required but the peer certificate is not checked.
+    required, but these records cannot authenticate the peer.
   * `not_applicable`: the chain to the MX host was DNSSEC-validated but there
     are no TLSA records (securely absent), so DANE does not apply.
   * `insecure_chain`: DANE is enabled but the chain to the MX host was not
     DNSSEC-validated, so DANE does not apply. A persistently high value here
     with none of the other results can indicate that the resolver is not
     performing DNSSEC validation.
-  * `tempfail`: the TLSA lookup could not be securely resolved (SERVFAIL,
-    timeout, or bogus); delivery is deferred.
+  * `tempfail`: the MX address-chain or TLSA lookup failed, was bogus, or
+    no longer provided addresses for a retained candidate. That candidate
+    cannot be used for this attempt.
 
-These are counters; reason about them as rates.
+These counters include connection setup and DNS-MX connection-reuse checks.
+They count policy evaluations, not unique messages, network DNS queries or
+handshakes; one message can cause multiple evaluations. Reason about them as
+rates, allowing for changes in connection reuse and traffic mix.
 
 **Confirming DANE is working:** with `enable_dane = true`, a healthy
 deployment shows a steady stream of `not_applicable` (most DNSSEC-signed
@@ -42,12 +47,11 @@ message to an address there and confirm that `ok` increments.
 
 **What to alert on:**
 
-  * A sustained or rising rate of `tempfail` is the highest-signal problem:
-    each one is a *deferred delivery* because the TLSA lookup could not be
-    securely resolved. This usually points at resolver or upstream-DNS
-    trouble (SERVFAIL, timeouts, bogus answers), and only rarely at an
-    active downgrade attempt; either way, mail is being delayed, so it is
-    worth paging on.
+  * A sustained or rising rate of `tempfail` warrants investigation. It
+    usually points at resolver or upstream-DNS trouble (SERVFAIL, timeouts,
+    bogus answers), and only rarely at an active downgrade attempt. A failed
+    reuse check defers the message; connection setup may still succeed via
+    another authorized MX, so this is not a count of deferred messages.
   * `ok` pinned at zero while `insecure_chain` is high (with
     `enable_dane = true`) indicates a non-validating resolver, i.e. DANE is
     not engaging at all.

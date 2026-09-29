@@ -59,6 +59,12 @@ configuration, including the configured `enable_tls` and feature switches,
 remains shared by the ready queue; these checks do not isolate arbitrary
 per-domain egress settings.
 
+The connection plan uses the ready queue's resolved candidates. A message with
+no authorized candidate in that plan defers rather than trying addresses outside
+it; a healthy connection for other messages remains available. Such a message
+can continue to defer while that shared plan remains in use. Actual candidate
+failures are included in the message's deferral diagnostic.
+
 Connection reuse must satisfy the message's effective TLS requirement. A
 `testing` message attempts advertised STARTTLS if the existing connection
 skipped TLS because it was disabled, but preserves an allowed opportunistic

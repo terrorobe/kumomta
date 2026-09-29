@@ -86,8 +86,8 @@ pub enum DaneStatus {
     Unusable,
     /// The secure status of the TLSA records (or of the MX host's address
     /// records) could not be determined, e.g. due to SERVFAIL, a timeout, or a
-    /// DNSSEC validation failure (bogus). To preserve downgrade resistance the
-    /// delivery must be deferred rather than continuing without authentication.
+    /// DNSSEC validation failure (bogus). The caller must not use this host for
+    /// the attempt; another authorized MX may still be tried.
     TempFail(String),
 }
 
@@ -651,6 +651,31 @@ pub async fn ip_lookup(
     Ok((result, exp))
 }
 
+// Resolver backends can return DNS errors inside Ok(Answer). Do not cache
+// those as unsigned addresses or as an ordinary empty address set.
+fn addresses_from_answer(name: &str, answer: &Answer) -> anyhow::Result<IpAddresses> {
+    anyhow::ensure!(
+        !answer.bogus,
+        "address lookup for {name} is bogus: {}",
+        answer
+            .why_bogus
+            .as_deref()
+            .unwrap_or("DNSSEC validation failed")
+    );
+    anyhow::ensure!(
+        matches!(
+            answer.response_code,
+            ResponseCode::NoError | ResponseCode::NXDomain
+        ),
+        "address lookup for {name} returned {}",
+        answer.response_code
+    );
+    Ok(IpAddresses {
+        addrs: answer.as_addr(),
+        secure: answer.secure,
+    })
+}
+
 pub async fn ipv4_lookup(
     key: &str,
     resolver: Option<&dyn Resolver>,
@@ -671,10 +696,7 @@ pub async fn ipv4_lookup(
                 .await?
         }
     };
-    let result = Arc::new(IpAddresses {
-        addrs: answer.as_addr(),
-        secure: answer.secure,
-    });
+    let result = Arc::new(addresses_from_answer(key, &answer)?);
     let expires = answer.expires;
     if resolver.is_none() {
         IPV4_CACHE
@@ -704,10 +726,7 @@ pub async fn ipv6_lookup(
                 .await?
         }
     };
-    let result = Arc::new(IpAddresses {
-        addrs: answer.as_addr(),
-        secure: answer.secure,
-    });
+    let result = Arc::new(addresses_from_answer(key, &answer)?);
     let expires = answer.expires;
     if resolver.is_none() {
         IPV6_CACHE
@@ -797,6 +816,56 @@ mod test {
             ),
             SecureCnameStatus::TempFail(_)
         ));
+    }
+
+    #[test]
+    fn address_answer_security() {
+        let records = vec![RData::A("127.0.0.1".parse().unwrap())];
+        for secure in [false, true] {
+            let result = addresses_from_answer(
+                "mx.example.com",
+                &answer(records.clone(), secure, ResponseCode::NoError),
+            )
+            .unwrap();
+            assert_eq!(result.secure, secure);
+            assert_eq!(result.addrs, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        }
+        for code in [ResponseCode::NoError, ResponseCode::NXDomain] {
+            let result =
+                addresses_from_answer("mx.example.com", &answer(vec![], true, code)).unwrap();
+            assert!(result.addrs.is_empty());
+        }
+        for code in [ResponseCode::ServFail, ResponseCode::Refused] {
+            assert!(addresses_from_answer("mx.example.com", &answer(vec![], false, code)).is_err());
+        }
+        // Bogus answers can still carry address records; neither those nor an
+        // empty bogus answer may become an apparently usable unsigned result.
+        for records in [vec![], records] {
+            let mut bogus = answer(records, false, ResponseCode::NoError);
+            bogus.bogus = true;
+            bogus.why_bogus = Some("invalid signature".into());
+            let err = addresses_from_answer("mx.example.com", &bogus).unwrap_err();
+            assert!(err.to_string().contains("invalid signature"));
+        }
+    }
+
+    #[tokio::test]
+    async fn address_lookup_propagates_response_errors() {
+        let resolver = TestResolver::default().with_servfail("mx.example.com");
+        for strategy in [
+            IpLookupStrategy::Ipv4Only,
+            IpLookupStrategy::Ipv6Only,
+            IpLookupStrategy::Ipv4AndIpv6,
+        ] {
+            let err = ip_lookup("mx.example.com", Some(&resolver), strategy)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&ResponseCode::ServFail.to_string()),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]

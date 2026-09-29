@@ -23,7 +23,7 @@ DANE-eligible (there is no name to query).
 | Secure | usable DANE-TA(2)/DANE-EE(3) record(s) | `Required`, with the server certificate checked against the `TLSA` records | deliver only if the certificate matches a record; otherwise defer and try the next host |
 | Secure | record(s) present but none usable | `RequiredInsecure` | STARTTLS required, but the server certificate is **not** checked |
 | Secure | securely absent (NODATA / NXDOMAIN) | your configured value | DANE does not apply; MTA-STS may still apply |
-| Secure | lookup failed (`SERVFAIL`, timeout, or bogus) | — | delivery is deferred (downgrade resistance); nothing is sent in the clear |
+| Secure | lookup failed (`SERVFAIL`, timeout, or bogus) | — | do not use this candidate; setup may try another authorized MX, while reuse defers the message |
 
 Notes:
 
@@ -175,16 +175,24 @@ The selected MX must belong to that message's effective MX set. Explicit
 `mx_list` routing continues to use `treat_mx_list_as_secure` and the resolved
 address's security status for its connection-time DANE decision.
 
-For an existing DNS-MX connection, the dispatcher obtains the current DANE result
-for its MX hostname and actual destination port through the configured resolver,
-which can use its DNS cache. Successful DANE authentication records the normalized
-TLSA set used by the handshake. An identical current TLSA set permits reuse across
+For DNS-MX connection setup and reuse, the dispatcher refreshes the selected
+address family's DNSSEC status through the resolver cache. The connection plan
+can outlive that cache: a failed lookup or a result with no addresses cannot be
+interpreted as an unsigned chain and used to disable DANE. The dispatcher then
+obtains the current TLSA result for the MX hostname and actual destination port
+through the configured resolver, which can use its DNS cache. Successful DANE
+authentication records the normalized TLSA set used by the handshake. An identical current TLSA set permits reuse across
 domains and after DNS refresh without another handshake. A different set requires
 fresh authentication, even if the existing certificate might also match it.
 A PKIX-validated connection alone is not evidence of DANE authentication.
 
 Absent or unusable TLSA records use the effective TLS posture in the table above,
-including any applicable MTA-STS override. A temporary or bogus lookup result
-defers the message rather than reusing an older DANE decision or downgrading to
-PKIX or plaintext. Policy decisions are snapshots for a message's delivery
-attempt, not a permanent property of the ready queue or connection.
+including any applicable MTA-STS override. A failed address-chain or TLSA check
+cannot authorize a weaker connection to that host. On connection setup, another
+authorized MX may still be tried under its own TLS requirements. On reuse, a
+lookup failure defers the current message rather than reusing an older DANE
+decision. Policy decisions are snapshots for a message's delivery attempt, not
+a permanent property of the ready queue or connection.
+
+[dane_result_count](../../metrics/kumod/dane_result_count.md) includes policy
+evaluations during setup and reuse, not just connection attempts or handshakes.

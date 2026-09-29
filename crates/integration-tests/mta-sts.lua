@@ -74,7 +74,12 @@ local function configure_dane(mode)
     } or nil,
     zones = {
       {
-        zone = '$ORIGIN enforce.example.com.\n@ 600 MX 10 mail.shared.example.com.\n',
+        zone = '$ORIGIN enforce.example.com.\n@ 600 MX 10 mail.shared.example.com.\n'
+          .. (
+            os.getenv 'KUMOD_MTA_STS_BACKUP'
+              and '@ 600 MX 20 mail.backup.example.com.\n'
+            or ''
+          ),
         secure = true,
       },
       {
@@ -86,12 +91,17 @@ local function configure_dane(mode)
         secure = false,
       },
       {
-        zone = '$ORIGIN shared.example.com.\nmail 600 A 127.0.0.1\n'
+        zone = '$ORIGIN shared.example.com.\n'
+          .. (mode == 'address_absent' and '' or 'mail 600 A 127.0.0.1\n')
           .. (
             tlsa
               and ('_' .. SINK_PORT .. '._tcp.mail 600 TLSA ' .. tlsa .. '\n')
             or ''
           ),
+        secure = true,
+      },
+      {
+        zone = '$ORIGIN backup.example.com.\nmail 600 A 127.0.0.1\n',
         secure = true,
       },
     },
@@ -123,6 +133,11 @@ kumo.on('test.update_sts', function()
         kumo.dns.lookup_mx 'evict.example.com'
         kumo.set_lruttl_cache_capacity('dns_resolver_mx', 1)
         kumo.set_lruttl_cache_capacity('dns_resolver_mx', 65536)
+        local refreshed = kumo.dns.lookup_mx 'transition.example.com'
+        assert(
+          refreshed.site_name == 'mail.other.example.com',
+          'MX cache did not pick up the changed policy'
+        )
       end
       os.remove(CONTROL .. '/policies.json')
       local ack = assert(io.open(CONTROL .. '/applied', 'w'))
@@ -133,6 +148,30 @@ kumo.on('test.update_sts', function()
       local mode = dane:read '*a'
       dane:close()
       configure_dane(mode)
+      if mode == 'address_absent' then
+        -- Retain the selected candidate but force fresh address answers. The
+        -- test resolver has a fixed TTL; eviction avoids a minute-long wait.
+        kumo.dns.lookup_addr 'evict.shared.example.com'
+        for _, cache in ipairs {
+          'dns_resolver_ip',
+          'dns_resolver_ipv4',
+          'dns_resolver_ipv6',
+        } do
+          -- There can be both aggregate and single-family IP cache entries.
+          for _ = 1, 3 do
+            kumo.set_lruttl_cache_capacity(cache, 1)
+          end
+          kumo.set_lruttl_cache_capacity(cache, 1024)
+        end
+        for _, strategy in ipairs { 'Ipv4Only', 'Ipv6Only', 'Ipv4AndIpv6' } do
+          local addresses =
+            kumo.dns.lookup_addr('mail.shared.example.com', nil, strategy)
+          assert(
+            #addresses == 0,
+            strategy .. ' address cache did not pick up the removed records'
+          )
+        end
+      end
       os.remove(CONTROL .. '/dane-mode')
       local ack = assert(io.open(CONTROL .. '/dane-applied', 'w'))
       ack:close()
@@ -240,17 +279,25 @@ mx: mail.shared.example.com
 mx: mail.backup.example.com
 max_age: 86400]]
   end
-  if os.getenv 'KUMOD_MTA_STS_COLLISION' then
+  local collision = os.getenv 'KUMOD_MTA_STS_COLLISION'
+  if collision then
+    local shared_ip = collision == 'failure' and '127.0.0.1' or '127.0.0.2'
+    local other_ip = collision == 'exhausted' and '127.0.0.2' or '127.0.0.1'
     kumo.dns.configure_test_resolver {
-      '$ORIGIN collision-a.example.com.\n@ 600 MX 10 a.x.targets.test.\n@ 600 MX 10 b.x.targets.test.\n@ 600 MX 10 c.y.targets.test.\n',
-      '$ORIGIN collision-b.example.com.\n@ 600 MX 10 a.x.targets.test.\n@ 600 MX 10 b.y.targets.test.\n@ 600 MX 10 c.x.targets.test.\n',
-      '$ORIGIN targets.test.\na.x 600 A 127.0.0.2\nb.x 600 A 127.0.0.1\nc.y 600 A 127.0.0.1\nb.y 600 A 127.0.0.1\nc.x 600 A 127.0.0.1\n',
+      '$ORIGIN collision-a.example.com.\n@ 600 MX 5 a.x.targets.test.\n@ 600 MX 10 b.x.targets.test.\n@ 600 MX 20 d.x.targets.test.\n@ 600 MX 30 c.y.targets.test.\n',
+      '$ORIGIN collision-b.example.com.\n@ 600 MX 5 a.x.targets.test.\n@ 600 MX 10 b.y.targets.test.\n@ 600 MX 20 d.x.targets.test.\n@ 600 MX 30 c.x.targets.test.\n',
+      '$ORIGIN targets.test.\na.x 600 A 127.0.0.2\nd.x 600 A '
+        .. shared_ip
+        .. '\nb.x 600 A 127.0.0.1\nc.y 600 A '
+        .. other_ip
+        .. '\nb.y 600 A 127.0.0.1\nc.x 600 A 127.0.0.1\n',
     }
     sts_policies['collision-a.example.com'] =
       'version: STSv1\nmode: none\nmax_age: 86400'
     sts_policies['collision-b.example.com'] = [[version: STSv1
 mode: enforce
 mx: a.x.targets.test
+mx: d.x.targets.test
 mx: b.y.targets.test
 mx: c.x.targets.test
 max_age: 86400]]
@@ -326,7 +373,9 @@ max_age: 86400]]
     reconnect_strategy = os.getenv 'KUMOD_MTA_STS_BACKUP'
         and 'ConnectNextHost'
       or nil,
-    idle_timeout = os.getenv 'KUMOD_MTA_STS_BACKUP' and '10s' or nil,
+    -- Control/trace waits must not retire the source connection accidentally.
+    -- Peer-closure tests observe the sink's shorter timeout explicitly.
+    idle_timeout = '1m',
     opportunistic_tls_reconnect_on_failed_handshake = os.getenv 'KUMOD_MTA_STS_FALLBACK'
       ~= nil,
     consecutive_connection_failures_before_delay = os.getenv 'KUMOD_MTA_STS_LIMIT'

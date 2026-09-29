@@ -54,20 +54,25 @@ declare_metric! {
 ///
 /// The `result` label is one of:
 ///
-///   * `ok`: usable DANE-TA(2)/DANE-EE(3) TLSA records were found; the peer
-///     certificate is checked against them.
+///   * `ok`: usable DANE-TA(2)/DANE-EE(3) TLSA records were found; DANE
+///     authentication is required, via a handshake or matching session evidence.
+///     This is not a count of successful handshakes or deliveries.
 ///   * `unusable`: TLSA records were published but none are usable; STARTTLS is
-///     required but the peer certificate is not checked.
+///     required, but these records cannot authenticate the peer.
 ///   * `not_applicable`: the chain to the MX host was DNSSEC-validated but there
 ///     are no TLSA records (securely absent), so DANE does not apply.
 ///   * `insecure_chain`: DANE is enabled but the chain to the MX host was not
 ///     DNSSEC-validated, so DANE does not apply. A persistently high value here
 ///     with none of the other results can indicate that the resolver is not
 ///     performing DNSSEC validation.
-///   * `tempfail`: the TLSA lookup could not be securely resolved (SERVFAIL,
-///     timeout, or bogus); delivery is deferred.
+///   * `tempfail`: the MX address-chain or TLSA lookup failed, was bogus, or
+///     no longer provided addresses for a retained candidate. That candidate
+///     cannot be used for this attempt.
 ///
-/// These are counters; reason about them as rates.
+/// These counters include connection setup and DNS-MX connection-reuse checks.
+/// They count policy evaluations, not unique messages, network DNS queries or
+/// handshakes; one message can cause multiple evaluations. Reason about them as
+/// rates, allowing for changes in connection reuse and traffic mix.
 ///
 /// **Confirming DANE is working:** with `enable_dane = true`, a healthy
 /// deployment shows a steady stream of `not_applicable` (most DNSSEC-signed
@@ -82,12 +87,11 @@ declare_metric! {
 ///
 /// **What to alert on:**
 ///
-///   * A sustained or rising rate of `tempfail` is the highest-signal problem:
-///     each one is a *deferred delivery* because the TLSA lookup could not be
-///     securely resolved. This usually points at resolver or upstream-DNS
-///     trouble (SERVFAIL, timeouts, bogus answers), and only rarely at an
-///     active downgrade attempt; either way, mail is being delayed, so it is
-///     worth paging on.
+///   * A sustained or rising rate of `tempfail` warrants investigation. It
+///     usually points at resolver or upstream-DNS trouble (SERVFAIL, timeouts,
+///     bogus answers), and only rarely at an active downgrade attempt. A failed
+///     reuse check defers the message; connection setup may still succeed via
+///     another authorized MX, so this is not a count of deferred messages.
 ///   * `ok` pinned at zero while `insecure_chain` is high (with
 ///     `enable_dane = true`) indicates a non-validating resolver, i.e. DANE is
 ///     not engaging at all.
@@ -259,6 +263,7 @@ impl SmtpDispatcher {
             },
         };
 
+        let mut resolution_errors = vec![];
         let addresses = if proto_config.mx_list.is_empty() {
             dispatcher
                 .mx
@@ -269,8 +274,15 @@ impl SmtpDispatcher {
         } else {
             let mut addresses = vec![];
             for a in proto_config.mx_list.iter() {
-                a.resolve_into(&mut addresses, path_config.ip_lookup_strategy)
-                    .await?;
+                if let Err(err) = a
+                    .resolve_into(&mut addresses, path_config.ip_lookup_strategy)
+                    .await
+                {
+                    // As with DNS MX resolution, one failed name must not
+                    // prevent trying the other authorized entries in the list.
+                    tracing::error!("failed to resolve mx_list entry {a:?}: {err:#}");
+                    resolution_errors.push(format!("{err:#}"));
+                }
             }
             // Note that ResolvedMxAddresses::Addresses is in LIFO
             // order, and we have FIFO order.  Reverse it!
@@ -311,6 +323,11 @@ impl SmtpDispatcher {
         };
 
         if addresses.is_empty() {
+            let mut content = "MX didn't resolve to any hosts".to_string();
+            if !resolution_errors.is_empty() {
+                content.push_str(": ");
+                content.push_str(&resolution_errors.join(", "));
+            }
             dispatcher
                 .bulk_ready_queue_operation(
                     Response {
@@ -320,7 +337,7 @@ impl SmtpDispatcher {
                             subject: 4,
                             detail: 4,
                         }),
-                        content: "MX didn't resolve to any hosts".to_string(),
+                        content,
                         command: None,
                     },
                     InsertReason::MxResolvedToZeroHosts.into(),
@@ -425,7 +442,6 @@ impl SmtpDispatcher {
         }
         drop(path);
         let Some(msg) = dispatcher.msgs.first() else {
-            // Aggressive connection opening can run before taking a message.
             return Ok(None);
         };
         let name = msg.get_queue_name().await?;
@@ -668,18 +684,32 @@ impl SmtpDispatcher {
             if satisfies {
                 return Ok(AttemptConnectionDisposition::ReusedExisting);
             }
+            if let Some(mx) = &message_mx {
+                if self
+                    .client_address
+                    .as_ref()
+                    .is_some_and(|address| !Self::mx_allows_address(mx, address))
+                    && !self
+                        .addresses
+                        .iter()
+                        .any(|address| Self::mx_allows_address(mx, address))
+                {
+                    // This message cannot use the plan. Keep the healthy session
+                    // for other domains instead of closing it just to defer.
+                    return Ok(AttemptConnectionDisposition::MessageDeferred(
+                        "no candidate in this ready queue belongs to the message's MX set".into(),
+                    ));
+                }
+            }
             // Peer closure has already been handled with reconnect_strategy.
             // A local policy switch retains the message and the remaining plan.
             self.tracer
                 .diagnostic(Level::INFO, || "Reconnecting for message TLS policy".into());
             self.close_connection(dispatcher).await?;
             if let Some(address) = self.client_address.take() {
-                if message_mx
-                    .as_ref()
-                    .is_none_or(|mx| Self::mx_allows_address(mx, &address))
-                {
-                    self.addresses.push(address);
-                }
+                // Selection below filters for the current message; this healthy
+                // host may still be useful to another domain on the ready queue.
+                self.addresses.push(address);
             }
         }
 
@@ -1224,11 +1254,31 @@ impl SmtpDispatcher {
                 None => self.treat_mx_list_as_secure,
             };
             let address_secure = if mx_selection_secure && mx.is_some() {
-                dns_resolver::ip_lookup(&address.name, None, path_config.ip_lookup_strategy)
+                // Refresh the selected address family. A successful lookup of
+                // the other family must not mask a failure for this candidate.
+                let ip = address
+                    .addr
+                    .ip()
+                    .context("DNS MX candidate has no IP address")?;
+                let strategy = if ip.is_ipv4() {
+                    IpLookupStrategy::Ipv4Only
+                } else {
+                    IpLookupStrategy::Ipv6Only
+                };
+                dns_resolver::ip_lookup(&address.name, None, strategy)
                     .await
+                    .and_then(|(addresses, _)| {
+                        // The plan can outlive the address cache. Absence is not
+                        // proof that the retained candidate has an unsigned chain.
+                        anyhow::ensure!(
+                            !addresses.addrs.is_empty(),
+                            "MX address lookup for {} returned no addresses while checking DANE",
+                            address.name
+                        );
+                        Ok(addresses.secure)
+                    })
+                    .inspect_err(|_| record_dane_result("tempfail"))
                     .context("resolving the MX address chain for DANE")?
-                    .0
-                    .secure
             } else {
                 address.is_secure
             };

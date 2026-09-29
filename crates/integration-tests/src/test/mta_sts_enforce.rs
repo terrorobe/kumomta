@@ -1,5 +1,6 @@
 use crate::kumod::{DaemonWithMaildirOptions, MailGenParams};
 use anyhow::Context;
+use kumo_api_types::{TraceSmtpClientV1Payload, TraceSmtpV1Payload};
 use kumo_log_types::RecordType::{Delivery, TransientFailure};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
@@ -132,6 +133,7 @@ enum DaneMode {
     Unusable,
     Absent,
     ServFail,
+    AddressAbsent,
 }
 
 impl DaneMode {
@@ -142,6 +144,7 @@ impl DaneMode {
             Self::Unusable => "unusable",
             Self::Absent => "absent",
             Self::ServFail => "servfail",
+            Self::AddressAbsent => "address_absent",
         }
     }
 }
@@ -1292,6 +1295,7 @@ async fn mta_sts_peer_close_precedes_policy_reconnect() -> anyhow::Result<()> {
         .env("KUMOD_UNTRUSTED_MTA_STS_TLS", "1")
         .start()
         .await?;
+    let trace = daemon.sink.trace_server().await?;
     let mut client = daemon.smtp_client().await?;
     send(&mut client, "first@none.example.com").await?;
     anyhow::ensure!(
@@ -1299,8 +1303,25 @@ async fn mta_sts_peer_close_precedes_policy_reconnect() -> anyhow::Result<()> {
             .wait_for_maildir_count(1, Duration::from_secs(10))
             .await
     );
-    // The sink sends 421 after 3s idle; the source's idle timeout is 10s.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Observe the peer's actual 421 and closure. The source timeout is longer
+    // than this wait, so it must retain the plan and apply reconnect_strategy.
+    anyhow::ensure!(
+        trace
+            .wait_for(
+                |events| {
+                    events.iter().any(|event| {
+                        matches!(&event.payload,
+            TraceSmtpV1Payload::Write(line) if line.starts_with("421 "))
+                    }) && events
+                        .iter()
+                        .any(|event| matches!(&event.payload, TraceSmtpV1Payload::Closed))
+                },
+                Duration::from_secs(10)
+            )
+            .await,
+        "sink did not close the idle connection"
+    );
+    trace.stop().await?;
     send(&mut client, "second@enforce.example.com").await?;
     anyhow::ensure!(
         daemon
@@ -1345,10 +1366,13 @@ async fn reuse_dane_across_domains(case: DaneReuseCase) -> anyhow::Result<()> {
         options = options.env("KUMOD_MTA_STS_NO_STS", "1");
     }
     if refresh {
-        options = options.env("KUMOD_MTA_STS_SHORT_DANE_MX", "1").env(
-            "KUMOD_MTA_STS_CONTROL",
-            control.path().display().to_string(),
-        );
+        options = options
+            .env("KUMOD_MTA_STS_SHORT_DANE_MX", "1")
+            .env("KUMOD_SINK_CLIENT_TIMEOUT", "30s")
+            .env(
+                "KUMOD_MTA_STS_CONTROL",
+                control.path().display().to_string(),
+            );
     }
     let mut daemon = options.start().await?;
     let mut client = daemon.smtp_client().await?;
@@ -1512,11 +1536,158 @@ async fn mta_sts_disabled_dane_unusable_requires_encryption() -> anyhow::Result<
     dane_policy_transition(DaneMode::Absent, DaneMode::Unusable, Delivery).await
 }
 
+/// A TLSA failure excludes that host, not a backup MX with its own valid
+/// no-TLSA result. No message data may go to the failed primary.
 #[tokio::test]
-async fn mta_sts_site_collision_does_not_authorize_other_hosts() -> anyhow::Result<()> {
+async fn mta_sts_dane_failure_tries_authorized_backup() -> anyhow::Result<()> {
+    let (_ca, options) = trusted_sink(&["mail.shared.example.com"])?;
+    let mut daemon = options
+        .env("KUMOD_MTA_STS_BACKUP", "1")
+        .env("KUMOD_MTA_STS_DANE", DaneMode::ServFail.as_env())
+        .env("KUMOD_MTA_STS_NO_STS", "1")
+        .env("KUMOD_MTA_STS_TLS", "Disabled")
+        .env("KUMOD_HIDE_STARTTLS", "1")
+        .env("KUMOD_MTA_STS_NO_RETRY", "1")
+        .start()
+        .await?;
+    let trace = daemon.source.trace_client().await?;
+    let mut client = daemon.smtp_client().await?;
+    send(&mut client, "recip@enforce.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await
+    );
+    anyhow::ensure!(
+        trace
+            .wait_for(
+                |events| events.iter().any(|event| {
+                    matches!(&event.payload, TraceSmtpClientV1Payload::Diagnostic { message, .. }
+            if message.contains("DANE TLSA lookup for mail.shared.example.com")
+                && message.contains("could not be securely resolved"))
+                }),
+                Duration::from_secs(10)
+            )
+            .await,
+        "primary TLSA failure was not observed"
+    );
+    trace.stop().await?;
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    let delivery = records
+        .iter()
+        .find(|r| r.kind == Delivery)
+        .context("backup delivery")?;
+    anyhow::ensure!(
+        delivery
+            .peer_address
+            .as_ref()
+            .is_some_and(|a| a.name == "mail.backup.example.com.")
+            && delivery.num_attempts == 0
+            && delivery.tls_cipher.is_none(),
+        "{delivery:?}"
+    );
+    anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 1);
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddressRefreshAt {
+    Ehlo,
+    Reuse,
+}
+
+async fn dane_address_refresh(at: AddressRefreshAt) -> anyhow::Result<()> {
+    let control = tempfile::tempdir()?;
+    let (_ca, mut options) = trusted_sink(&["mail.shared.example.com"])?;
+    options = options
+        .env("KUMOD_MTA_STS_DANE", DaneMode::Matching.as_env())
+        .env("KUMOD_MTA_STS_NO_STS", "1")
+        .env("KUMOD_MTA_STS_TLS", "Disabled")
+        .env("KUMOD_MTA_STS_NO_RETRY", "1")
+        .env(
+            "KUMOD_MTA_STS_CONTROL",
+            control.path().display().to_string(),
+        );
+    if at == AddressRefreshAt::Ehlo {
+        options = options
+            .env("KUMOD_MTA_STS_HOLD_EHLO", "1")
+            .env("KUMOD_HIDE_STARTTLS", "1");
+    }
+    let mut daemon = options.start().await?;
+    let mut client = daemon.smtp_client().await?;
+    send(&mut client, "first@enforce.example.com").await?;
+    if at == AddressRefreshAt::Ehlo {
+        wait_file(&control.path().join("ehlo-entered")).await?;
+    } else {
+        anyhow::ensure!(
+            daemon
+                .wait_for_maildir_count(1, Duration::from_secs(10))
+                .await
+        );
+    }
+    update_dane(control.path(), DaneMode::AddressAbsent).await?;
+    if at == AddressRefreshAt::Ehlo {
+        std::fs::write(control.path().join("ehlo-release"), "")?;
+    } else {
+        send(&mut client, "second@enforce.example.com").await?;
+    }
+    let delivered_before_refresh = usize::from(at == AddressRefreshAt::Reuse);
+    anyhow::ensure!(
+        daemon
+            .wait_for_source_summary(
+                |s| s.get(&TransientFailure).copied().unwrap_or(0) > 0
+                    || s.get(&Delivery).copied().unwrap_or(0) > delivered_before_refresh,
+                Duration::from_secs(10)
+            )
+            .await
+    );
+    std::fs::write(control.path().join("stop"), "")?;
+    daemon.stop_both().await?;
+    let records = daemon.source.collect_logs().await?;
+    anyhow::ensure!(
+        records
+            .iter()
+            .any(|r| r.kind == TransientFailure && r.response.content.contains("no addresses")),
+        "address refresh bypassed DANE: {records:?}"
+    );
+    anyhow::ensure!(daemon.extract_maildir_messages()?.len() == delivered_before_refresh);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mta_sts_dane_address_refresh_before_handshake() -> anyhow::Result<()> {
+    dane_address_refresh(AddressRefreshAt::Ehlo).await
+}
+
+#[tokio::test]
+async fn mta_sts_dane_address_refresh_before_reuse() -> anyhow::Result<()> {
+    dane_address_refresh(AddressRefreshAt::Reuse).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollisionPlan {
+    OtherCandidates,
+    LastCandidate,
+    FailedAuthorizedCandidate,
+}
+
+impl CollisionPlan {
+    fn as_env(self) -> &'static str {
+        match self {
+            Self::OtherCandidates => "remaining",
+            Self::LastCandidate => "exhausted",
+            Self::FailedAuthorizedCandidate => "failure",
+        }
+    }
+}
+
+async fn site_collision_preserves_plan(plan: CollisionPlan) -> anyhow::Result<()> {
     let (_ca, options) = trusted_sink(&["b.x.targets.test", "c.y.targets.test"])?;
     let mut daemon = options
-        .env("KUMOD_MTA_STS_COLLISION", "1")
+        .env("KUMOD_MTA_STS_COLLISION", plan.as_env())
+        // Do not race the sink idle timeout while waiting for source log flush.
+        .env("KUMOD_SINK_CLIENT_TIMEOUT", "30s")
         .env("KUMOD_MTA_STS_NO_RETRY", "1")
         .start()
         .await?;
@@ -1535,6 +1706,12 @@ async fn mta_sts_site_collision_does_not_authorize_other_hosts() -> anyhow::Resu
                     || s.get(&TransientFailure).copied().unwrap_or(0) > 0,
                 Duration::from_secs(10)
             )
+            .await
+    );
+    send(&mut client, "third@collision-a.example.com").await?;
+    anyhow::ensure!(
+        daemon
+            .wait_for_maildir_count(2, Duration::from_secs(10))
             .await
     );
     daemon.stop_both().await?;
@@ -1560,6 +1737,49 @@ async fn mta_sts_site_collision_does_not_authorize_other_hosts() -> anyhow::Resu
         second.kind == TransientFailure,
         "used an unauthorized MX: {second:?}"
     );
-    anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 1);
+    anyhow::ensure!(
+        second.response.code == 451,
+        "routing mismatch counted as connection failure: {second:?}"
+    );
+    let third = records
+        .iter()
+        .find(|r| {
+            r.kind == Delivery
+                && r.recipient
+                    .iter()
+                    .any(|addr| addr == "third@collision-a.example.com")
+        })
+        .context("third delivery")?;
+    anyhow::ensure!(
+        third.num_attempts == 0 && third.peer_address == first.peer_address,
+        "healthy candidate was lost: {first:?} {third:?}"
+    );
+    if plan == CollisionPlan::FailedAuthorizedCandidate {
+        anyhow::ensure!(
+            second
+                .response
+                .content
+                .contains("certificate verify failed"),
+            "lost candidate failure: {second:?}"
+        );
+    } else {
+        assert_same_sink_connection(&daemon).await?;
+    }
+    anyhow::ensure!(daemon.extract_maildir_messages()?.len() == 2);
     Ok(())
+}
+
+#[tokio::test]
+async fn mta_sts_site_collision_does_not_authorize_other_hosts() -> anyhow::Result<()> {
+    site_collision_preserves_plan(CollisionPlan::OtherCandidates).await
+}
+
+#[tokio::test]
+async fn mta_sts_site_collision_preserves_last_candidate() -> anyhow::Result<()> {
+    site_collision_preserves_plan(CollisionPlan::LastCandidate).await
+}
+
+#[tokio::test]
+async fn mta_sts_site_collision_retains_candidate_failures() -> anyhow::Result<()> {
+    site_collision_preserves_plan(CollisionPlan::FailedAuthorizedCandidate).await
 }

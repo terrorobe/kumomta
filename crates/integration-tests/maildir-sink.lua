@@ -19,7 +19,7 @@ kumo.on('init', function()
     max_recipients_per_message = 4,
     -- This client_timeout value is coupled with assumptions
     -- in disconnect_peer_idle_out!
-    client_timeout = '3s',
+    client_timeout = os.getenv 'KUMOD_SINK_CLIENT_TIMEOUT' or '3s',
     -- A capturing sink should store what it receives without rewriting it,
     -- so it does not prepend its own X-KumoRef supplemental trace header.
     trace_headers = {
@@ -169,6 +169,22 @@ kumo.on('smtp_server_auth_plain', function(authz, authc, password)
 end)
 
 kumo.on('smtp_server_ehlo', function(domain, conn_meta, extensions)
+  if os.getenv 'KUMOD_MTA_STS_HOLD_EHLO' then
+    local control = assert(os.getenv 'KUMOD_MTA_STS_CONTROL')
+    local entered = assert(io.open(control .. '/ehlo-entered', 'w'))
+    entered:close()
+    local released = false
+    for _ = 1, 300 do
+      local release = io.open(control .. '/ehlo-release')
+      if release then
+        release:close()
+        released = true
+        break
+      end
+      kumo.time.sleep(0.05)
+    end
+    assert(released, 'test did not release held EHLO')
+  end
   local revised = {}
   for _, ext in ipairs(extensions) do
     local include = true

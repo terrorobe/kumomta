@@ -2139,7 +2139,11 @@ impl Dispatcher {
                 ) => {
                     // fall through to below logic to do the send
                 }
-                Ok(AttemptConnectionDisposition::MessageDeferred(reason)) => {
+                Ok(AttemptConnectionDisposition::MessageDeferred(mut reason)) => {
+                    if !connection_failures.is_empty() {
+                        reason.push_str("; previous connection failures: ");
+                        reason.push_str(&connection_failures.join(", "));
+                    }
                     dispatcher
                         .defer_messages(Response {
                             code: 451,
@@ -2208,8 +2212,8 @@ impl Dispatcher {
         }
     }
 
-    /// Defer only the messages held by this dispatcher. A message-local failure
-    /// must not stun the shared provider queue or consume connection candidates.
+    /// Defer only the messages held by this dispatcher. The caller decides
+    /// whether a failure also requires shared queue backoff.
     async fn defer_messages(&mut self, response: Response) -> anyhow::Result<()> {
         for msg in self.msgs.drain(..) {
             log_disposition(LogDisposition {
