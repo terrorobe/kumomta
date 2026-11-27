@@ -219,13 +219,12 @@ async fn pipelined_refusals_on_reused_connection() -> anyhow::Result<()> {
     submit_for_transient_failures(&daemon, &messages, Duration::from_secs(50)).await?;
 
     // Both 450 replies increment the same counter, despite distinct enhanced codes.
-    // Each pipelined DATA refusal still counts when the classifier throws.
+    // The consequential DATA refusals remain in the logs below, not the counter.
     assert_peer_refusals(
         &daemon,
         &[
             (["sink", "450", "temporary"], 2.0),
             (["sink", "452", "other"], 1.0),
-            (["sink", "503", "other"], 3.0),
         ],
     )
     .await?;
@@ -319,17 +318,66 @@ async fn pipelined_refusals_on_reused_connection() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn submit_deferred_batch(
+    daemon: &DaemonWithMaildir,
+    message: MailGenParams<'_>,
+) -> anyhow::Result<()> {
+    let mut client = daemon.smtp_client().await?;
+    assert_eq!(message.send_batch(&mut client).await?.response.code, 250);
+    assert!(
+        daemon
+            .wait_for_source_summary(
+                |s| s.contains_key(&TransientFailure),
+                Duration::from_secs(10)
+            )
+            .await
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unretained_recipient_refusal_counts_but_secondary_data_does_not() -> anyhow::Result<()> {
+    let mut daemon = telemetry_options("classify")
+        .env("KUMOD_BATCH_HANDLING", "BatchByDomain")
+        .start()
+        .await?;
+    // Fill the eight retained slots. The next RCPT would normally classify as `temporary`;
+    // its result must still count as `other`, while the omitted pipelined DATA 503 must not count.
+    let mut recipients: Vec<_> = (0..8)
+        .map(|i| format!("tempfail-{i}@example.com"))
+        .collect();
+    recipients.push("retry-short@example.com".to_owned());
+    let message = MailGenParams {
+        recip_list: Some(recipients.iter().map(String::as_str).collect()),
+        ..Default::default()
+    };
+    submit_deferred_batch(&daemon, message).await?;
+    assert_peer_refusals(
+        &daemon,
+        &[
+            (["sink", "400", "other"], 8.0),
+            (["sink", "450", "other"], 1.0),
+        ],
+    )
+    .await?;
+    daemon.stop_both().await
+}
+
 async fn data_dot_failure(
     options: DaemonWithMaildirOptions,
     outcome: &str,
     refusals: &[([&str; 3], f64)],
 ) -> anyhow::Result<SmtpDispositionFields> {
-    let mut daemon = options.start().await?;
+    let mut daemon = options
+        .env("KUMOD_BATCH_HANDLING", "BatchByDomain")
+        .start()
+        .await?;
     let message = MailGenParams {
         sender: Some("disconnect-in-data-no-421@example.com"),
+        recip_list: Some(vec!["first@example.com", "second@example.com"]),
         ..Default::default()
     };
-    submit_for_transient_failures(&daemon, &[message], Duration::from_secs(10)).await?;
+    submit_deferred_batch(&daemon, message).await?;
     assert_peer_refusals(&daemon, refusals).await?;
     let outcomes = metric_samples(&daemon, "smtp_client_transaction_duration_seconds", |m| {
         (m.labels()["outcome"].to_string(), m.as_histogram().count)
@@ -353,7 +401,8 @@ async fn data_dot_failure(
 
 #[tokio::test]
 async fn data_dot_peer_refusal() -> anyhow::Result<()> {
-    let expected = [(["sink", "451", "other"], 1.0)];
+    // One DATA-dot reply decided both recipients' results in a single transaction.
+    let expected = [(["sink", "451", "other"], 2.0)];
     let smtp = data_dot_failure(telemetry_options("1"), "deferred", &expected).await?;
     assert_eq!(smtp.failure_kind, Some("smtp_reply".into()));
     let peer = smtp.peer_response.context("missing peer reply")?;

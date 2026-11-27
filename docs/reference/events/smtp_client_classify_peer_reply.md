@@ -16,4 +16,4 @@ end)
 
 If the handler is absent, fails, times out or returns no allowed reason, the reason is `other`. The handler cannot replace or suppress the [peer text in local logs](../log_record.md#outbound-smtp-disposition-fields) or change the SMTP disposition.
 
-Keep the handler fast and local. If the client cannot retain a reply for classification, it still counts the refusal with `reason="other"`.
+Keep the handler fast and local. Retained secondary replies also reach the classifier for logging, but do not increment the [refusal counter](../kumo/configure_smtp_client_telemetry.md). If a counted reply cannot be retained for classification, its reason is `other`.

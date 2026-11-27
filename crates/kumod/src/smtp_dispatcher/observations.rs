@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
-// Limit classifier input and log payload, never the count of wire replies.
+// Limit retained diagnostics, not the number of recipients a refusal can affect.
 const MAX_REPLIES: usize = 8;
 
 fn ms(d: Duration) -> f64 {
@@ -107,7 +107,7 @@ fn hostname(host: &str) -> &str {
 
 #[derive(Debug, Default)]
 pub(super) struct Plan {
-    provider: String,
+    provider: &'static str,
     setup_start: Option<Instant>,
     tcp_candidates: usize,
     attempt_number: u64,
@@ -141,7 +141,7 @@ impl SmtpDispatcher {
             prefs.next().is_none().then_some(pref)
         });
         let socket = Arc::new(SocketObserver {
-            provider: metrics::provider(&address.name).into(),
+            provider: metrics::provider(&address.name),
             mx: address.name.clone(),
             ip: address.addr.ip(),
             preference: pref,
@@ -177,7 +177,7 @@ impl SmtpDispatcher {
             if s.ip.is_some() {
                 plan.setup_start.get_or_insert(start);
                 if plan.tcp_candidates == 0 {
-                    metrics::first_candidate(&s.provider, ready);
+                    metrics::first_candidate(s.provider, ready);
                 }
                 plan.tcp_candidates += 1;
             }
@@ -189,7 +189,7 @@ impl SmtpDispatcher {
         if ready || self.addresses.is_empty() {
             // A pre-dial failure can exhaust a plan that already tried an IP.
             if let Some(elapsed) = setup {
-                metrics::setup(&plan.provider, ready, plan.tcp_candidates, elapsed);
+                metrics::setup(plan.provider, ready, plan.tcp_candidates, elapsed);
             }
             plan.setup_start = None;
             plan.tcp_candidates = 0;
@@ -241,18 +241,25 @@ pub(super) async fn connect_unix(
 }
 
 struct PendingReply {
-    provider: Arc<str>,
+    provider: &'static str,
     stage: SmtpStage,
     response: Response,
     truncated: bool,
-    counted: bool,
+    // Setup/idle: one. During delivery: number of recipients assigned this reply.
+    pending_count: u64,
 }
 
 impl PendingReply {
     async fn classify(&mut self) -> SmtpPeerResponse {
-        let reason =
-            metrics::peer_reply(&self.provider, self.stage, &self.response, self.truncated).await;
-        self.counted = true;
+        let reason = metrics::peer_reply(
+            self.provider,
+            self.stage,
+            &self.response,
+            self.truncated,
+            self.pending_count,
+        )
+        .await;
+        self.pending_count = 0;
         let mut reply = SmtpPeerResponse::new(self.response.code, self.response.enhanced_code)
             .with_content(std::mem::take(&mut self.response.content), self.truncated);
         reply.reason = reason.map(Into::into);
@@ -262,11 +269,8 @@ impl PendingReply {
 
 impl Drop for PendingReply {
     fn drop(&mut self) {
-        // Covers unprocessed observations when the payload is capped or the
-        // dispatcher shuts down before the classifier returns.
-        if !self.counted {
-            metrics::peer_reply_unclassified(&self.provider, self.response.code);
-        }
+        // If classification was cancelled, preserve the assigned count as `other`.
+        metrics::peer_reply_unclassified(self.provider, self.response.code, self.pending_count);
     }
 }
 
@@ -301,12 +305,13 @@ struct State {
     dial: Option<Instant>,
     setup_failure: Option<(&'static str, &'static str)>,
     ready: Option<ReadySocket>,
+    in_transaction: bool,
     terminal: Option<(SmtpStage, Option<SmtpFailureKind>, Option<Duration>)>,
     replies: Replies,
 }
 
 pub(super) struct SocketObserver {
-    provider: Arc<str>,
+    provider: &'static str,
     mx: String,
     ip: Option<IpAddr>,
     preference: Option<u16>,
@@ -326,7 +331,7 @@ impl std::fmt::Debug for SocketObserver {
 impl Drop for SocketObserver {
     fn drop(&mut self) {
         if let Some(ready) = self.state.get_mut().ready.take() {
-            metrics::connection_closed(&self.provider, ready.attempted, ready.accepted);
+            metrics::connection_closed(self.provider, ready.attempted, ready.accepted);
         }
     }
 }
@@ -393,7 +398,7 @@ impl SocketObserver {
     }
 
     fn phase(&self, phase: &'static str, duration: Duration, failure: Option<&'static str>) {
-        metrics::phase(&self.provider, phase, failure.is_none(), duration);
+        metrics::phase(self.provider, phase, failure.is_none(), duration);
         // A successful later operation supersedes a recovered failure. A local
         // policy error after it must not be attributed to that wire operation.
         self.state.lock().setup_failure = failure.map(|kind| (phase, kind));
@@ -412,7 +417,7 @@ impl SocketObserver {
         policy_veto: bool,
         whole_message_peer: Option<&ResolvedAddress>,
     ) -> Transaction {
-        let (terminal, ready, replies) = {
+        let (terminal, ready, mut replies) = {
             let mut state = self.state.lock();
             (
                 state.terminal.take(),
@@ -439,7 +444,7 @@ impl SocketObserver {
                     Some(SmtpFailureKind::SmtpReply) => "bounced",
                     _ => "transport_error",
                 };
-                metrics::transaction_completed(&self.provider, outcome, duration);
+                metrics::transaction_completed(self.provider, outcome, duration);
                 fields.transaction_number = Some(number);
                 fields.transaction_elapsed_ms = Some(ms(duration));
                 fields.connection_setup_ms = setup.filter(|_| number == 1).map(ms);
@@ -454,6 +459,10 @@ impl SocketObserver {
             Some((_, None, Some(_))) => Some(SmtpStage::RcptTo),
             _ => None,
         };
+        // Assign weights from the original recipient results, including failures before MAIL FROM (e.g. RSET).
+        for reply in &mut replies.items {
+            reply.pending_count = 0;
+        }
         let mut next_slot = 0;
         let per_recipient = responses
             .iter()
@@ -469,11 +478,14 @@ impl SocketObserver {
                     (next_slot..replies.items.len()).find(|&i| replies.items[i].stage == stage);
                 let primary = if let Some(i) = slot {
                     next_slot = i + usize::from(stage == SmtpStage::RcptTo);
+                    replies.items[i].pending_count += 1;
                     Some(Primary::Retained(i))
                 } else {
                     next_slot = replies.items.len();
-                    (replies.omitted != 0)
-                        .then_some(Primary::Omitted(response.code, response.enhanced_code))
+                    (replies.omitted != 0).then(|| {
+                        metrics::peer_reply_unclassified(self.provider, response.code, 1);
+                        Primary::Omitted(response.code, response.enhanced_code)
+                    })
                 };
                 Some((stage, primary))
             })
@@ -497,16 +509,17 @@ impl SmtpClientObserver for SocketObserver {
                 truncated,
             } => {
                 let mut state = self.state.lock();
+                let pending_count = u64::from(!state.in_transaction);
                 if state.replies.items.len() == MAX_REPLIES {
                     state.replies.omitted += 1;
-                    metrics::peer_reply_unclassified(&self.provider, response.code);
+                    metrics::peer_reply_unclassified(self.provider, response.code, pending_count);
                 } else {
                     state.replies.items.push(PendingReply {
-                        provider: self.provider.clone(),
+                        provider: self.provider,
                         stage,
                         response,
                         truncated,
-                        counted: false,
+                        pending_count,
                     });
                 }
             }
@@ -516,9 +529,11 @@ impl SmtpClientObserver for SocketObserver {
                 failure,
             } => self.phase(stage.as_str(), duration, failure.map(|k| k.as_str())),
             SmtpObservation::MailFromStarted => {
-                if let Some(r) = self.state.lock().ready.as_mut() {
+                let mut state = self.state.lock();
+                state.in_transaction = true;
+                if let Some(r) = state.ready.as_mut() {
                     r.attempted += 1;
-                    metrics::transaction_started(&self.provider, r.attempted == 1);
+                    metrics::transaction_started(self.provider, r.attempted == 1);
                 }
             }
             SmtpObservation::TransactionFinished {
@@ -527,6 +542,7 @@ impl SmtpClientObserver for SocketObserver {
                 failure,
             } => {
                 let mut state = self.state.lock();
+                state.in_transaction = false;
                 state.terminal = Some((stage, failure, Some(duration)));
                 if failure.is_none() {
                     if let Some(r) = state.ready.as_mut() {
@@ -609,7 +625,7 @@ mod test {
 
     fn socket() -> SocketObserver {
         SocketObserver {
-            provider: "other".into(),
+            provider: "other",
             mx: "mx.example".into(),
             ip: None,
             preference: None,

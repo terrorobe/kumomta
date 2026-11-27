@@ -61,6 +61,20 @@ impl Events {
     fn take(&self) -> Vec<SmtpObservation> {
         std::mem::take(&mut *self.0.lock().unwrap())
     }
+
+    fn assert_transaction_only(
+        &self,
+        expected_stage: SmtpStage,
+        expected_failure: Option<SmtpFailureKind>,
+    ) {
+        use SmtpObservation::*;
+        let events = self.take();
+        let [MailFromStarted, TransactionFinished { stage, failure, .. }] = events.as_slice()
+        else {
+            panic!("expected only transaction start and finish, got {events:?}");
+        };
+        assert_eq!((*stage, *failure), (expected_stage, expected_failure));
+    }
 }
 
 fn fixture(buffer: usize) -> (SmtpClient, DuplexStream, Arc<Events>) {
@@ -93,10 +107,8 @@ async fn send(client: &mut SmtpClient, data: &[u8]) -> Result<Response, ClientEr
         .await
 }
 
-#[tokio::test]
-async fn pipeline_reports_all_peer_refusals_once_before_selecting_terminal_reply() {
-    use SmtpObservation::*;
-    let (mut client, mut peer, events) = fixture(4096);
+async fn pipelined_fixture(buffer: usize) -> (SmtpClient, DuplexStream, Arc<Events>) {
+    let (mut client, mut peer, events) = fixture(buffer);
     peer.write_all(b"250-mx.example\r\n250 PIPELINING\r\n")
         .await
         .unwrap();
@@ -104,13 +116,19 @@ async fn pipeline_reports_all_peer_refusals_once_before_selecting_terminal_reply
     client.set_enable_pipelining(true);
     assert!(matches!(
         events.take().as_slice(),
-        [Phase {
+        [SmtpObservation::Phase {
             stage: SmtpStage::Ehlo,
             failure: None,
             ..
         }]
     ));
+    (client, peer, events)
+}
 
+#[tokio::test]
+async fn pipeline_reports_all_peer_refusals_once_before_selecting_terminal_reply() {
+    use SmtpObservation::*;
+    let (mut client, mut peer, events) = pipelined_fixture(4096).await;
     peer.write_all(b"550-5.7.1 first line\r\n550 5.7.1 second line\r\n450 4.7.1 busy\r\n503 5.5.1 bad sequence\r\n").await.unwrap();
     assert!(
         matches!(send(&mut client, b"body").await, Err(ClientError::Rejected(r)) if r.code == 550)
@@ -130,28 +148,12 @@ async fn pipeline_reports_all_peer_refusals_once_before_selecting_terminal_reply
         .await
         .unwrap();
     assert_eq!(send(&mut client, b"body").await.unwrap().code, 250);
-    assert!(matches!(
-        events.take().as_slice(),
-        [
-            MailFromStarted,
-            TransactionFinished {
-                stage: SmtpStage::DataDot,
-                failure: None,
-                ..
-            }
-        ]
-    ));
+    events.assert_transaction_only(SmtpStage::DataDot, None);
 }
 
 #[tokio::test]
 async fn mixed_recipient_pipeline_keeps_the_refusal_on_an_accepted_transaction() {
-    let (mut client, mut peer, events) = fixture(4096);
-    peer.write_all(b"250-test\r\n250 PIPELINING\r\n")
-        .await
-        .unwrap();
-    client.ehlo("sender.example.org").await.unwrap();
-    client.set_enable_pipelining(true);
-    events.take();
+    let (mut client, mut peer, events) = pipelined_fixture(4096).await;
 
     peer.write_all(b"250 sender\r\n450 4.7.1 busy\r\n250 recipient\r\n354 go\r\n250 accepted\r\n")
         .await
@@ -215,17 +217,7 @@ async fn assert_final_dot_timeout(
             ..
         })
     ));
-    assert!(matches!(
-        events.take().as_slice(),
-        [
-            SmtpObservation::MailFromStarted,
-            SmtpObservation::TransactionFinished {
-                stage,
-                failure: Some(kind),
-                ..
-            }
-        ] if *stage == expected_stage && *kind == expected_failure
-    ));
+    events.assert_transaction_only(expected_stage, Some(expected_failure));
 }
 
 #[tokio::test]
@@ -242,30 +234,14 @@ async fn final_dot_flush_timeout_keeps_public_error_but_reports_a_data_write_fai
 #[tokio::test]
 async fn pipeline_write_timeout_is_attributed_to_the_batch() {
     // Enough room for EHLO and its reply, but not the MAIL/RCPT/DATA batch.
-    let (mut client, mut peer, events) = fixture(40);
-    peer.write_all(b"250-test\r\n250 PIPELINING\r\n")
-        .await
-        .unwrap();
-    client.ehlo("sender.example.org").await.unwrap();
-    events.take();
-    client.set_enable_pipelining(true);
+    let (mut client, _peer, events) = pipelined_fixture(40).await;
     client.timeouts.mail_from_timeout = Duration::ZERO;
     client.timeouts.rcpt_to_timeout = Duration::ZERO;
     client.timeouts.data_timeout = Duration::ZERO;
     assert!(
         matches!(send(&mut client, b"body").await, Err(ClientError::TimeOutRequest { commands, .. }) if commands.len() == 3)
     );
-    assert!(matches!(
-        events.take().as_slice(),
-        [
-            SmtpObservation::MailFromStarted,
-            SmtpObservation::TransactionFinished {
-                stage: SmtpStage::Pipeline,
-                failure: Some(SmtpFailureKind::WriteTimeout),
-                ..
-            }
-        ]
-    ));
+    events.assert_transaction_only(SmtpStage::Pipeline, Some(SmtpFailureKind::WriteTimeout));
 }
 
 #[tokio::test]
@@ -279,17 +255,7 @@ async fn stalled_body_write_is_distinct_from_a_data_or_dot_reply() {
         send(&mut client, &[b'x'; 256]).await,
         Err(ClientError::TimeOutData)
     ));
-    assert!(matches!(
-        events.take().as_slice(),
-        [
-            SmtpObservation::MailFromStarted,
-            SmtpObservation::TransactionFinished {
-                stage: SmtpStage::DataWrite,
-                failure: Some(SmtpFailureKind::WriteTimeout),
-                ..
-            }
-        ]
-    ));
+    events.assert_transaction_only(SmtpStage::DataWrite, Some(SmtpFailureKind::WriteTimeout));
 }
 
 #[tokio::test]

@@ -1310,7 +1310,7 @@
   },
   {
     "name": "smtp_client_peer_refusals_total",
-    "help": "Negative replies read from the SMTP peer, counted before disposition policy.",
+    "help": "Negative peer replies selected per recipient during delivery; setup and idle refusals count once per reply.",
     "doc": "`smtp_code` is the peer's numeric reply code (400–599). For provider and reason\nlabels, see [kumo.configure_smtp_client_telemetry](../../kumo/configure_smtp_client_telemetry.md).",
     "metric_type": "Counter",
     "label_names": [

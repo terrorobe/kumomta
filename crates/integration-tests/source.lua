@@ -41,7 +41,7 @@ if SMTP_TELEMETRY == 'classify' then
       assert(dsn.class == 5 and dsn.subject == 7 and dsn.detail == 8)
       return { reason = 'auth_failed' }
     end
-    -- The pipelined DATA refusal is still counted and logged if classification fails.
+    -- The pipelined DATA refusal is still logged if classification fails.
     error 'classifier failed'
   end)
 end

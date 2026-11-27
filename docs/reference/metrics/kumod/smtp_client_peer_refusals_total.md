@@ -5,7 +5,7 @@
 Type: Counter
 Labels: destination_relay_group, smtp_code, reason
 ```
-Negative replies read from the SMTP peer, counted before disposition policy.
+Negative peer replies selected per recipient during delivery; setup and idle refusals count once per reply.
 
 
 !!! info
