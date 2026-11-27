@@ -60,6 +60,7 @@ pub async fn log_rejection(args: LogRejection) {
             source_address: None,
             provider_name: None,
             session_id: args.session_id,
+            smtp: None,
         };
         if let Err(err) = logger.log(record, None).await {
             tracing::error!("failed to log: {err:#}");

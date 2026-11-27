@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 pub mod rfc3464;
 pub mod rfc5965;
+pub mod smtp;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolvedAddress {
@@ -79,6 +80,9 @@ pub enum RecordType {
     /// and we are now responsible for delivery.
     XferIn,
 
+    /// A local connection diagnostic, not a message disposition.
+    SmtpConnection,
+
     /// Special for matching anything in the logging config
     Any,
 }
@@ -93,6 +97,7 @@ impl RecordType {
         match self {
             Self::Any
             | Self::Reception
+            | Self::SmtpConnection
             | Self::Delivery
             | Self::DeferredInjectionRebind
             | Self::AdminRebind
@@ -217,7 +222,7 @@ ts_serializer!(ct_serializer, CreationTimeSerializer, created, created_time);
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JsonLogRecord {
     /// What kind of record this is
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "disposition_kind")]
     pub kind: RecordType,
     /// The message id
     pub id: String,
@@ -292,6 +297,20 @@ pub struct JsonLogRecord {
     /// the same connection for either ingress or egress
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Uuid>,
+
+    /// Optional outbound SMTP diagnostics from a local file logger.
+    #[serde(flatten, deserialize_with = "smtp::deserialize_disposition_fields")]
+    pub smtp: Option<Box<smtp::SmtpDispositionFields>>,
+}
+
+fn disposition_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RecordType, D::Error> {
+    let kind = RecordType::deserialize(d)?;
+    if kind == RecordType::SmtpConnection {
+        return Err(serde::de::Error::custom(
+            "SmtpConnection is not a disposition",
+        ));
+    }
+    Ok(kind)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,5 +325,5 @@ pub struct MaybeProxiedSourceAddress {
 #[cfg(all(test, target_pointer_width = "64"))]
 #[test]
 fn sizes() {
-    assert_eq!(std::mem::size_of::<JsonLogRecord>(), 720);
+    assert_eq!(std::mem::size_of::<JsonLogRecord>(), 728);
 }

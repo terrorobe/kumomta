@@ -87,8 +87,8 @@ impl LogHookState {
         loop {
             let cmd = match self.receiver.recv_async().await {
                 Ok(cmd) => cmd,
-                other => {
-                    tracing::debug!("logging channel closed {other:?}");
+                Err(err) => {
+                    tracing::debug!("logging channel closed: {err}");
                     return;
                 }
             };
@@ -97,6 +97,9 @@ impl LogHookState {
                     tracing::debug!("LogCommand::Terminate received. Stopping writing logs");
                     break;
                 }
+                // Connection diagnostics have no envelope and must never enter
+                // should_enqueue_log_record, even if misrouted here.
+                LogCommand::SmtpConnection(_) => continue,
                 LogCommand::Record(record, _msg) => {
                     if let Err(err) = self.do_record(record).await {
                         tracing::error!("failed to log: {err:#}");

@@ -2,6 +2,7 @@ use crate::logging::classify::{apply_classification, ClassifierParams};
 use crate::logging::disposition_hooks::{DispHookParams, RecordWrapper};
 use crate::logging::files::{LogFileParams, LogThreadState};
 use crate::logging::hooks::{LogHookParams, LogHookState};
+use crate::logging::smtp_client::ConnectionLog;
 use anyhow::Context;
 use bstr::ByteSlice;
 use camino::Utf8PathBuf;
@@ -23,6 +24,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 
@@ -32,6 +34,7 @@ pub(crate) mod disposition_hooks;
 pub(crate) mod files;
 pub(crate) mod hooks;
 pub(crate) mod rejection;
+pub(crate) mod smtp_client;
 
 declare_metric! {
 /// how many times submission of a log event hit the back_pressure
@@ -76,6 +79,10 @@ pub struct LogRecordParams {
     #[serde(default)]
     pub template: Option<String>,
 
+    /// Also log individual SmtpConnection events taking at least this long.
+    #[serde(default, with = "duration_serde")]
+    pub slow_threshold: Option<Duration>,
+
     /// Written to the start of each newly created log file segment
     #[serde(default)]
     pub segment_header: String,
@@ -85,9 +92,9 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug)]
 pub(crate) enum LogCommand {
     Record(JsonLogRecord, Option<Message>),
+    SmtpConnection(Arc<smtp::SmtpConnectionRecord>),
     Terminate,
 }
 
@@ -112,6 +119,7 @@ pub struct Logger {
     headers: Vec<String>,
     enabled: HashMap<RecordType, bool>,
     filter_event: Option<String>,
+    connection_log: Option<ConnectionLog>,
     hook_name: Option<String>,
     name: String,
     submit_latency: Histogram,
@@ -123,6 +131,7 @@ impl Logger {
     }
 
     pub async fn init_disp_hook(params: DispHookParams) -> anyhow::Result<()> {
+        smtp_client::validate_config(&params.per_record, false)?;
         let mut loggers = LOGGER.lock();
 
         if loggers
@@ -152,6 +161,7 @@ impl Logger {
             meta: Default::default(),
             headers: Default::default(),
             enabled,
+            connection_log: None,
             filter_event: None,
             hook_name: Some(hook_name),
             name,
@@ -163,6 +173,7 @@ impl Logger {
     }
 
     pub async fn init_hook(params: LogHookParams) -> anyhow::Result<()> {
+        smtp_client::validate_config(&params.per_record, false)?;
         let mut loggers = LOGGER.lock();
 
         if loggers
@@ -218,6 +229,7 @@ impl Logger {
             meta,
             headers,
             enabled,
+            connection_log: None,
             filter_event: None,
             hook_name: Some(hook_name),
             name,
@@ -229,6 +241,8 @@ impl Logger {
     }
 
     pub async fn init(params: LogFileParams) -> anyhow::Result<()> {
+        smtp_client::validate_config(&params.per_record, true)?;
+        let connection_log = ConnectionLog::configured(&params.per_record);
         let mut template_engine = TemplateEngine::new();
 
         for (kind, per_rec) in &params.per_record {
@@ -298,6 +312,7 @@ impl Logger {
             headers,
             enabled,
             filter_event,
+            connection_log,
             hook_name: None,
             name,
             submit_latency,
@@ -308,6 +323,9 @@ impl Logger {
     }
 
     pub fn record_is_enabled(&self, kind: RecordType) -> bool {
+        if kind == RecordType::SmtpConnection {
+            return self.connection_log.is_some();
+        }
         if let Some(enabled) = self.enabled.get(&kind) {
             return *enabled;
         }

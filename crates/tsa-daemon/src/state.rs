@@ -1296,6 +1296,7 @@ connection_limit = 3
             tls_peer_subject_name: None,
             provider_name: None,
             session_id: None,
+            smtp: None,
         }
     }
 

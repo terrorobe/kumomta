@@ -5,7 +5,7 @@ tags:
 
 ## Log Record
 
-The log record is a JSON object with the following shape:
+Message log records are JSON objects with the following shape. [SMTP connection records](#smtp-connection-records) describe connection setup and have no message envelope.
 
 ```json
 {
@@ -206,6 +206,38 @@ The following record types are defined:
   kumomta node as part of an [xfer](kcli/xfer.md). {{since('2025.12.02-67ee9e96', inline=True)}}
 * `"XferIn"` - a message was transferred in to the current node from another
   kumomta node as part of an [xfer](kcli/xfer.md). {{since('2025.12.02-67ee9e96', inline=True)}}
+* `"SmtpConnection"` - a local record of an outbound SMTP connection attempt or address-list build. See [SMTP connection records](#smtp-connection-records). {{since('dev', inline=True)}}
+
+## Outbound SMTP disposition fields
+
+{{since('dev')}}
+
+When [outbound SMTP client telemetry](kumo/configure_smtp_client_telemetry.md) is enabled, local `Delivery`, `TransientFailure` and `Bounce` records can include the following fields. Existing local templates can reference them directly or through `log_record`. They are not added to log hooks.
+
+| Field | Meaning |
+| --- | --- |
+| `connection_id` | Identifies one SMTP-ready connection. Unlike `session_id`, it changes on reconnect. |
+| `transaction_number` | Counts `MAIL FROM` attempts on that connection, starting at `1`. Recipients in one transaction share the same number. |
+| `transaction_elapsed_ms` | Milliseconds from the start of `MAIL FROM` to the final reply or transport failure. |
+| `connection_setup_ms` | On the first transaction only, milliseconds from the first TCP attempt to SMTP-ready, including failed attempts. Neither elapsed field is present if the transaction never started. |
+| `smtp_stage`, `failure_kind` | Where and how SMTP failed. Stages name steps such as `rcpt_to`, `data`, `data_write`, `data_dot` or `pipeline`, without command arguments. `smtp_reply` identifies an actual negative peer reply; a local timeout is not a reply. |
+| `peer_response` | The observed negative peer reply for `failure_kind: smtp_reply`, when available, even if policy rewrote the disposition. Contains `code` and, when available, `enhanced_code`, `reason` and the peer's parsed `content`. The peer's `enhanced_code` is preserved even when its class differs from `code`; it is absent when the peer supplied none. |
+| `peer_replies`, `peer_replies_omitted` | Other negative replies from the transaction as `{smtp_stage, response}` pairs, with a count when replies were omitted. They are not additional failed recipients. |
+
+At every stage, including AUTH, `content` comes from the server's reply, never from the client command or the [Lua classifier](events/smtp_client_classify_peer_reply.md). KumoMTA retains up to 256 bytes of the parsed text without splitting a UTF-8 character and sets `content_truncated: true` if it clipped the text. Treat peer text as untrusted: the server can echo addresses, credentials or message content. JSON escaping preserves the text; it does not sanitize or redact it.
+
+The existing `response` describes the disposition and can contain native command and response text, including synthetic local errors. `event_time - created_time` is the age of the message, including retries, not a measurement of time in a particular queue.
+
+## SMTP connection records
+
+{{since('dev')}}
+
+Each `SmtpConnection` record has `timestamp`, `event_time`, the dispatcher's `session_id`, and the selected `egress_source`. It has no spool ID, envelope, or message creation time. The `event` field determines the other top-level fields:
+
+* `attempt` identifies an endpoint by `mx` and, when known, `ip` and MX `preference`. `attempt_number` starts at 1 for each new setup; `elapsed_ms` measures that attempt alone. The `outcome` is `smtp_ready` (with a `connection_id` that matches its dispositions) or `failed` (with `smtp_stage` and `failure_kind` when known). Observed negative replies use the same `peer_replies` format as [dispositions](#outbound-smtp-disposition-fields); `peer_replies_omitted` counts replies not retained.
+* `address_list` reports `usable_ip_candidates` and `outcome`: `no_address` for an empty list, `partial` if a lookup yielded no usable addresses but another candidate is available, or `complete` otherwise. `address_list_build_ms` measures the interval from the first address lookup until the list is ready; it is absent when no lookup ran.
+
+See [per_record](kumo/configure_local_logs/per_record.md#smtp-connection-records) for event selection and template configuration.
 
 ## Feedback Report
 

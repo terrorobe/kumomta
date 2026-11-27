@@ -1,3 +1,4 @@
+use crate::logging::smtp_client::ConnectionLog;
 use crate::logging::{LogCommand, LogRecordParams};
 use anyhow::Context;
 use chrono::Utc;
@@ -8,7 +9,7 @@ use kumo_server_common::disk_space::MinFree;
 use kumo_server_common::log::{mark_existing_logs_as_done_in_dir, OpenedFile};
 use kumo_server_memory::subscribe_to_memory_status_changes_async;
 use kumo_template::{Template, TemplateEngine};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -165,8 +166,8 @@ impl LogThreadState {
             };
             let cmd = match cmd {
                 Ok(cmd) => cmd,
-                other => {
-                    tracing::debug!("logging channel closed {other:?}");
+                Err(err) => {
+                    tracing::debug!("logging channel closed: {err}");
                     return;
                 }
             };
@@ -174,6 +175,11 @@ impl LogThreadState {
                 LogCommand::Terminate => {
                     tracing::debug!("LogCommand::Terminate received. Stopping writing logs");
                     break;
+                }
+                LogCommand::SmtpConnection(record) => {
+                    if let Err(err) = self.do_smtp_connection(record) {
+                        tracing::error!("failed to log SMTP connection record: {err:#}");
+                    }
                 }
                 LogCommand::Record(record, _msg) => {
                     if let Err(err) = self.do_record(record) {
@@ -276,9 +282,34 @@ impl LogThreadState {
     }
 
     fn do_record(&mut self, record: JsonLogRecord) -> anyhow::Result<()> {
-        tracing::trace!("do_record {record:?}");
+        if record.smtp.is_none() {
+            tracing::trace!("do_record {record:?}");
+        }
         let record = Arc::new(record);
-        let file_key = if let Some(per_rec) = self.per_record(record.kind) {
+        self.write_record(record.kind, &record.id, &record, record.smtp.is_some())
+    }
+
+    fn do_smtp_connection(
+        &mut self,
+        record: Arc<smtp::SmtpConnectionRecord>,
+    ) -> anyhow::Result<()> {
+        if ConnectionLog::configured(&self.params.per_record).is_none() {
+            return Ok(());
+        }
+        self.write_record(RecordType::SmtpConnection, "", &record, true)
+    }
+
+    fn write_record<T: Serialize + Send + Sync + 'static>(
+        &mut self,
+        kind: RecordType,
+        id: &str,
+        record: &Arc<T>,
+        has_smtp_diagnostics: bool,
+    ) -> anyhow::Result<()> {
+        if has_smtp_diagnostics {
+            tracing::trace!("writing {kind:?} record");
+        }
+        let file_key = if let Some(per_rec) = self.per_record(kind) {
             FileNameKey {
                 log_dir: per_rec
                     .log_dir
@@ -296,15 +327,20 @@ impl LogThreadState {
         };
 
         let mut record_text = Vec::new();
-        if let Some(template) =
-            Self::resolve_template(&self.params, &self.template_engine, record.kind)
-        {
-            let prepared = self
+        if let Some(template) = Self::resolve_template(&self.params, &self.template_engine, kind) {
+            let rendered = self
                 .template_engine
-                .prepare_context_with_alias(record.clone(), "log_record")?;
-            record_text = template.render_prepared(&prepared)?.into_bytes();
+                .prepare_context_with_alias(record.clone(), "log_record")
+                .and_then(|context| template.render_prepared(&context));
+            // A template error can contain the value it tried to render. Keep
+            // diagnostic fields out of tracing, including on this failure path.
+            if has_smtp_diagnostics && rendered.is_err() {
+                anyhow::bail!("failed to render {kind:?} template");
+            }
+            record_text = rendered?.into_bytes();
         } else {
-            serde_json::to_writer(&mut record_text, &*record).context("serializing record")?;
+            serde_json::to_writer(&mut record_text, record.as_ref())
+                .context("serializing record")?;
         }
         if record_text.last() != Some(&b'\n') {
             record_text.push(b'\n');
@@ -318,7 +354,7 @@ impl LogThreadState {
         let max = self.params.max_record_size;
         let len = record_text.len().saturating_sub(1);
         if len >= max {
-            self.note_oversize_drop(&file_key.log_dir, record.kind, &record.id, len, max);
+            self.note_oversize_drop(&file_key.log_dir, kind, id, len, max);
             return Ok(());
         }
 
@@ -380,7 +416,7 @@ impl LogThreadState {
                     .map(|duration| Instant::now() + duration),
             };
 
-            if let Some(per_rec) = self.per_record(record.kind) {
+            if let Some(per_rec) = self.per_record(kind) {
                 if !per_rec.segment_header.is_empty() {
                     file.file
                         .write_all(per_rec.segment_header.as_bytes())
@@ -424,6 +460,8 @@ mod test {
     use super::*;
     use flume::bounded;
     use rfc5321::Response;
+
+    mod smtp_diagnostics;
 
     fn state(log_dir: PathBuf, max_record_size: usize) -> LogThreadState {
         let params: LogFileParams = serde_json::from_value(serde_json::json!({
@@ -476,6 +514,7 @@ mod test {
             tls_peer_subject_name: None,
             provider_name: None,
             session_id: None,
+            smtp: None,
         }
     }
 

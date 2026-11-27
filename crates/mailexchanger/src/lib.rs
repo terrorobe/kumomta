@@ -826,6 +826,26 @@ impl MailExchanger {
         max_plan_size: usize,
         max_addresses_per_host: usize,
     ) -> ResolvedMxAddresses {
+        self.resolve_addresses_with_stats(
+            resolver,
+            strategy,
+            max_plan_size,
+            max_addresses_per_host,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::resolve_addresses`], optionally accumulating statistics for
+    /// the list build. Cached A/AAAA lookups count; literals and null MX do not.
+    pub async fn resolve_addresses_with_stats(
+        &self,
+        resolver: Option<&dyn Resolver>,
+        strategy: IpLookupStrategy,
+        max_plan_size: usize,
+        max_addresses_per_host: usize,
+        mut stats: Option<&mut AddressListStats>,
+    ) -> ResolvedMxAddresses {
         let mut result = vec![];
 
         // `by_pref` is a BTreeMap keyed by MX preference (lowest first);
@@ -857,12 +877,18 @@ impl MailExchanger {
                     continue;
                 }
 
+                if let Some(stats) = &mut stats {
+                    stats.start_lookup();
+                }
                 match ip_lookup(mx_host, resolver, strategy).await {
                     Err(err) => {
                         tracing::error!("failed to resolve {mx_host}: {err:#}");
                         continue;
                     }
                     Ok((lookup, _expires)) => {
+                        if let Some(stats) = &mut stats {
+                            stats.resolved_host(lookup.addrs.len());
+                        }
                         for addr in lookup.addrs.iter().take(max_addresses_per_host) {
                             let mut addr: HostOrSocketAddress = (*addr).into();
                             if let Some(port) = opt_port {
@@ -900,6 +926,37 @@ impl MailExchanger {
         // try ends up as the last element.
         result.reverse();
         ResolvedMxAddresses::Addresses(result)
+    }
+}
+
+/// Aggregate A/AAAA resolution for one candidate list, including cache hits.
+#[derive(Debug, Default)]
+pub struct AddressListStats {
+    pub first_lookup: Option<Instant>,
+    pub mx_hosts_looked_up: usize,
+    hosts_with_addresses: usize,
+}
+
+impl AddressListStats {
+    pub fn start_lookup(&mut self) {
+        self.first_lookup.get_or_insert_with(Instant::now);
+        self.mx_hosts_looked_up += 1;
+    }
+
+    pub fn resolved_host(&mut self, address_count: usize) {
+        self.hosts_with_addresses += usize::from(address_count != 0);
+    }
+
+    /// Consider the final list, since a literal or pre-resolved candidate can
+    /// still provide a destination even when all hostname lookups failed.
+    pub fn outcome(&self, candidates: usize) -> &'static str {
+        if candidates == 0 {
+            "no_address"
+        } else if self.hosts_with_addresses == self.mx_hosts_looked_up {
+            "complete"
+        } else {
+            "partial"
+        }
     }
 }
 
@@ -1245,6 +1302,53 @@ Addresses(
 )
 "#
         );
+    }
+
+    #[tokio::test]
+    async fn address_list_stats_follow_address_family_and_caps() {
+        let resolver = fixture_resolver(&[r#"
+$ORIGIN lookup.test.
+@ 600 MX 10 ipv4.lookup.test.
+@ 600 MX 20 ipv6.lookup.test.
+@ 600 MX 30 failure.lookup.test.
+ipv4 600 A 192.0.2.1
+ipv4 600 A 192.0.2.2
+ipv6 600 AAAA 2001:db8::1
+failure 600 A 192.0.2.3
+"#])
+        .with_bogus("failure.lookup.test.");
+        let ipv4: &[&str] = &["ipv4.lookup.test."];
+        for (domain, plan_cap, host_cap, names, looked_up, outcome) in [
+            // The IPv6-only and bogus hosts yield no IPv4 candidates.
+            ("lookup.test", 50, 1, ipv4, 3, "partial"),
+            // The preferred RRset alone exceeds the plan cap. No lower
+            // preference lookup is needed, so none counts against the outcome.
+            ("lookup.test", 1, 10, ipv4, 1, "complete"),
+            ("ipv6.lookup.test", 50, 10, &[], 1, "no_address"),
+            ("[192.0.2.3]", 50, 10, &["192.0.2.3"], 0, "complete"),
+        ] {
+            let mx = MailExchanger::resolve_via(domain, Some(&resolver))
+                .await
+                .unwrap();
+            let mut stats = AddressListStats::default();
+            let ResolvedMxAddresses::Addresses(addresses) = mx
+                .resolve_addresses_with_stats(
+                    Some(&resolver),
+                    IpLookupStrategy::Ipv4Only,
+                    plan_cap,
+                    host_cap,
+                    Some(&mut stats),
+                )
+                .await
+            else {
+                panic!("unexpected null MX for {domain}");
+            };
+            let actual_names: Vec<_> = addresses.iter().map(|a| a.name.as_str()).collect();
+            assert_eq!(actual_names, names);
+            assert_eq!(stats.mx_hosts_looked_up, looked_up);
+            assert_eq!(stats.first_lookup.is_some(), looked_up != 0);
+            assert_eq!(stats.outcome(addresses.len()), outcome);
+        }
     }
 
     #[tokio::test]
@@ -1659,6 +1763,20 @@ $ORIGIN example.com.
             .await
             .unwrap())
         .clone();
+        let mut stats = AddressListStats::default();
+        assert!(matches!(
+            mx.resolve_addresses_with_stats(
+                Some(&resolver),
+                IpLookupStrategy::default(),
+                50,
+                10,
+                Some(&mut stats)
+            )
+            .await,
+            ResolvedMxAddresses::NullMx
+        ));
+        assert_eq!(stats.mx_hosts_looked_up, 0);
+        assert!(stats.first_lookup.is_none());
         mx.expires.take();
         k9::snapshot!(
             &mx,

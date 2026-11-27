@@ -325,6 +325,7 @@ impl EgressSource {
         &self,
         address: SocketAddr,
         timeout_duration: Duration,
+        observe: Option<impl Fn(Instant, Result<(), std::io::ErrorKind>) + Sync>,
     ) -> anyhow::Result<(TcpStream, MaybeProxiedSourceAddress)> {
         let source_name = &self.name;
 
@@ -345,7 +346,7 @@ impl EgressSource {
         for proxy in candidates {
             let transport_address = proxy.transport_address(address);
             match self
-                .connect_one(address, proxy, deadline, timeout_duration)
+                .connect_one(address, proxy, deadline, timeout_duration, observe.as_ref())
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -405,6 +406,7 @@ impl EgressSource {
         proxy: ProxyProto<'_>,
         deadline: Instant,
         timeout_duration: Duration,
+        observe: Option<&(impl Fn(Instant, Result<(), std::io::ErrorKind>) + Sync)>,
     ) -> anyhow::Result<(TcpStream, MaybeProxiedSourceAddress)> {
         let source_name = &self.name;
         let transport_address = proxy.transport_address(address);
@@ -445,10 +447,19 @@ impl EgressSource {
             }
         }
 
+        // Time the actual socket operation, not proxy DNS, source selection,
+        // bind, or the proxy handshake. A cancelled dial has no result.
+        let timer = observe.map(|f| (f, Instant::now()));
+        let dial_result = |result| {
+            if let Some((observe, start)) = timer {
+                observe(start, result);
+            }
+        };
         let mut stream =
             match tokio::time::timeout_at(deadline.into(), socket.connect(transport_address)).await
             {
                 Err(_) => {
+                    dial_result(Err(std::io::ErrorKind::TimedOut));
                     inc_failed_proxy_connection_attempts(is_proxy);
                     return Err(ConnectError {
                         is_proxy,
@@ -460,6 +471,7 @@ impl EgressSource {
                     .into());
                 }
                 Ok(Err(err)) => {
+                    dial_result(Err(err.kind()));
                     inc_failed_proxy_connection_attempts(is_proxy);
                     return Err(ConnectError {
                         is_proxy,
@@ -467,7 +479,10 @@ impl EgressSource {
                     }
                     .into());
                 }
-                Ok(Ok(stream)) => stream,
+                Ok(Ok(stream)) => {
+                    dial_result(Ok(()));
+                    stream
+                }
             };
 
         let source_address = tokio::time::timeout_at(

@@ -1,9 +1,11 @@
+use crate::logging::smtp_client::{disposition_for_logger, prepare_disposition};
 use crate::logging::Logger;
 use crate::smtp_server::RelayDisposition;
 use bounce_classify::BounceClass;
 use chrono::Utc;
 use config::{load_config, CallbackSignature};
 use kumo_log_types::rfc3464::ReportAction;
+use kumo_log_types::smtp::SmtpDispositionFields;
 use kumo_log_types::MaybeProxiedSourceAddress;
 pub use kumo_log_types::*;
 use message::Message;
@@ -32,6 +34,17 @@ pub struct LogDisposition<'a> {
 }
 
 pub async fn log_disposition(args: LogDisposition<'_>) {
+    log_smtp_disposition(args, None, None).await;
+}
+
+/// A saved transaction peer accompanies local SMTP fields only. Without fields,
+/// all sinks receive the native disposition, including its original peer.
+pub async fn log_smtp_disposition(
+    args: LogDisposition<'_>,
+    fields: Option<SmtpDispositionFields>,
+    local_peer_address: Option<&ResolvedAddress>,
+) {
+    let fields = fields.and_then(|fields| prepare_disposition(args.kind, fields));
     let LogDisposition {
         mut kind,
         msg,
@@ -150,6 +163,12 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
             tls_peer_subject_name.replace(info.subject_name.clone());
         }
 
+        let (record_peer, smtp) = disposition_for_logger(
+            logger.hook_name.as_deref(),
+            peer_address,
+            fields.as_ref(),
+            local_peer_address,
+        );
         let record = JsonLogRecord {
             kind,
             id: msg.id().to_string(),
@@ -165,7 +184,7 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
                 .await
                 .unwrap_or_else(|err| format!("{err:#}")),
             site: site.to_string(),
-            peer_address: peer_address.cloned(),
+            peer_address: record_peer.cloned(),
             response: response.clone(),
             timestamp: now,
             created: msg.id().created(),
@@ -185,6 +204,7 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
             source_address: source_address.clone(),
             provider_name: provider.map(|s| s.to_string()),
             session_id,
+            smtp: smtp.cloned().map(Box::new),
         };
         if let Err(err) = logger.log(record, Some(msg.clone())).await {
             tracing::error!("failed to log: {err:#}");
@@ -282,6 +302,7 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
                             source_address: None,
                             provider_name: provider.map(|s| s.to_string()),
                             session_id,
+                            smtp: None,
                         };
 
                         if let Err(err) =

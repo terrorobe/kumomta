@@ -16,6 +16,35 @@ local MAX_RECIPIENTS_PER_BATCH = (os.getenv 'KUMOD_MAX_RECIPIENTS_PER_BATCH')
   or 100
 local USE_SPLIT_TXN = os.getenv 'KUMOD_USE_SPLIT_TXN'
 local INVALID_LINE_ENDINGS = os.getenv 'KUMOD_INVALID_LINE_ENDINGS'
+local SMTP_TELEMETRY = os.getenv 'KUMOD_TEST_SMTP_TELEMETRY'
+
+if SMTP_TELEMETRY == 'classify' then
+  kumo.on('smtp_client_classify_peer_reply', function(group, stage, reply)
+    if stage == 'rcpt_to' then
+      local dsn = reply.enhanced_code
+      if
+        group == 'sink'
+        and dsn
+        and reply.content
+        and (
+          (dsn.class == 4 and reply.content == 'tempfail requested')
+          or (dsn.class == 5 and reply.content:match ' retry later$')
+        )
+      then
+        -- Only the reason is used; this field must not replace the peer's text.
+        return { reason = 'temporary', content = 'Retry later' }
+      end
+      return { reason = 'unlisted' }
+    end
+    if stage == 'auth' and reply.code == 535 and reply.content == nil then
+      local dsn = reply.enhanced_code
+      assert(dsn.class == 5 and dsn.subject == 7 and dsn.detail == 8)
+      return { reason = 'auth_failed' }
+    end
+    -- The pipelined DATA refusal is still logged if classification fails.
+    error 'classifier failed'
+  end)
+end
 
 kumo.on('init', function()
   kumo.configure_accounting_db_path(TEST_DIR .. '/accounting.db')
@@ -52,8 +81,28 @@ kumo.on('init', function()
     listen = '127.0.0.1:0',
   }
 
+  local per_record
+  if SMTP_TELEMETRY then
+    local policy = {
+      providers = { sink = { 'localhost', 'workinghost' } },
+      reasons = { 'temporary', 'auth_failed' },
+    }
+    kumo.configure_smtp_client_telemetry(policy)
+    if SMTP_TELEMETRY == 'classify' then
+      kumo.configure_smtp_client_telemetry(policy)
+      assert(not pcall(kumo.configure_smtp_client_telemetry, {}))
+    end
+    per_record = {
+      SmtpConnection = {
+        log_dir = TEST_DIR .. '/connections',
+        slow_threshold = os.getenv 'KUMOD_TEST_SMTP_SLOW_THRESHOLD',
+      },
+    }
+  end
+
   kumo.configure_local_logs {
     log_dir = TEST_DIR .. '/logs',
+    per_record = per_record,
     max_segment_duration = '1s',
     headers = { 'X-*', 'Y-*', 'Subject' },
     meta = { 'xfer*' },
@@ -288,6 +337,11 @@ kumo.on('get_queue_config', function(domain, tenant, campaign, routing_domain)
     },
   }
 
+  if SMTP_TELEMETRY == 'classify' then
+    -- skip_hosts excludes this IPv6 candidate; it must not affect the plan's provider.
+    table.insert(protocol.smtp.mx_list, { name = 'skipped', addr = '[::1]:' .. SINK_PORT })
+  end
+
   if domain == 'two-hosts.example.com' then
     protocol = {
       -- Redirect traffic to the sink, but with two hosts in the connection plan
@@ -360,6 +414,7 @@ kumo.on('get_egress_path_config', function(domain, source_name, _site_name)
   local params = {
     enable_tls = os.getenv 'KUMOD_ENABLE_TLS' or 'OpportunisticInsecure',
     tls_mode = os.getenv 'KUMOD_EGRESS_TLS_MODE' or 'StartTls',
+    data_dot_timeout = os.getenv 'KUMOD_TEST_DATA_DOT_TIMEOUT',
     reconnect_strategy = os.getenv 'KUMOD_RECONNECT_STRATEGY'
       or 'ConnectNextHost',
     prohibited_hosts = {},
@@ -418,8 +473,13 @@ kumo.on('get_egress_path_config', function(domain, source_name, _site_name)
     params.allow_smtp_auth_plain_without_valid_certificate = true
   end
 
-  if domain == 'two-hosts.example.com' then
+  if domain == 'two-hosts.example.com' or SMTP_TELEMETRY == 'classify' then
     params.connection_limit = 1
+  end
+
+  if SMTP_TELEMETRY == 'unused' then
+    -- Close each ready socket after one message, even for a local refusal.
+    params.max_deliveries_per_connection = 1
   end
 
   if domain == 'webhookbatch.log_hook' then

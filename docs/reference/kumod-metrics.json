@@ -517,6 +517,17 @@
     "pruning": "NonPruning"
   },
   {
+    "name": "log_smtp_connection_dropped_total",
+    "help": "SMTP connection records discarded because the local file logger queue was full or closed.",
+    "doc": null,
+    "metric_type": "Counter",
+    "label_names": [
+      "logger"
+    ],
+    "buckets": [],
+    "pruning": "NonPruning"
+  },
+  {
     "name": "log_submit_full",
     "help": "how many times submission of a log event hit the back_pressure",
     "doc": null,
@@ -1294,6 +1305,187 @@
     "doc": null,
     "metric_type": "Gauge",
     "label_names": [],
+    "buckets": [],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_peer_refusals_total",
+    "help": "Negative peer replies selected per recipient during delivery; setup and idle refusals count once per reply.",
+    "doc": "`smtp_code` is the peer's numeric reply code (400–599). For provider and reason\nlabels, see [kumo.configure_smtp_client_telemetry](../../kumo/configure_smtp_client_telemetry.md).",
+    "metric_type": "Counter",
+    "label_names": [
+      "destination_relay_group",
+      "smtp_code",
+      "reason"
+    ],
+    "buckets": [],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_plan_attempts",
+    "help": "IPs tried per completed SMTP connection plan.",
+    "doc": null,
+    "metric_type": "Histogram",
+    "label_names": [
+      "destination_relay_group",
+      "outcome"
+    ],
+    "buckets": [
+      1.0,
+      2.0,
+      3.0,
+      4.0,
+      8.0,
+      16.0,
+      32.0,
+      64.0
+    ],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_setup_address_list_build_duration_seconds",
+    "help": "Seconds from the first address lookup until the candidate list is available.",
+    "doc": null,
+    "metric_type": "Histogram",
+    "label_names": [
+      "outcome"
+    ],
+    "buckets": [
+      0.001,
+      0.01,
+      0.05,
+      0.1,
+      0.25,
+      1.0,
+      2.0,
+      5.0,
+      15.0,
+      60.0,
+      300.0,
+      600.0
+    ],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_setup_duration_seconds",
+    "help": "Seconds from the first TCP attempt until the plan is ready or exhausted.",
+    "doc": null,
+    "metric_type": "Histogram",
+    "label_names": [
+      "destination_relay_group",
+      "outcome"
+    ],
+    "buckets": [
+      0.001,
+      0.01,
+      0.05,
+      0.1,
+      0.25,
+      1.0,
+      2.0,
+      5.0,
+      15.0,
+      60.0,
+      300.0,
+      600.0
+    ],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_setup_first_candidate_total",
+    "help": "Plans whose first attempted IP reached a known setup outcome.",
+    "doc": null,
+    "metric_type": "Counter",
+    "label_names": [
+      "destination_relay_group",
+      "outcome"
+    ],
+    "buckets": [],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_setup_phase_duration_seconds",
+    "help": "Seconds spent in one DNS or SMTP connection setup step.",
+    "doc": null,
+    "metric_type": "Histogram",
+    "label_names": [
+      "destination_relay_group",
+      "phase",
+      "outcome"
+    ],
+    "buckets": [
+      0.001,
+      0.01,
+      0.05,
+      0.1,
+      0.25,
+      1.0,
+      2.0,
+      5.0,
+      15.0,
+      60.0,
+      300.0,
+      600.0
+    ],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_transaction_duration_seconds",
+    "help": "Seconds from MAIL FROM to the terminal SMTP reply or transport failure.",
+    "doc": null,
+    "metric_type": "Histogram",
+    "label_names": [
+      "destination_relay_group",
+      "outcome"
+    ],
+    "buckets": [
+      0.001,
+      0.01,
+      0.05,
+      0.1,
+      0.25,
+      1.0,
+      2.0,
+      5.0,
+      15.0,
+      60.0,
+      300.0,
+      600.0
+    ],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_transactions_per_connection",
+    "help": "Attempted and accepted transactions per closed SMTP-ready connection, including unused connections.",
+    "doc": null,
+    "metric_type": "Histogram",
+    "label_names": [
+      "destination_relay_group",
+      "measure"
+    ],
+    "buckets": [
+      0.5,
+      1.0,
+      2.0,
+      4.0,
+      8.0,
+      16.0,
+      32.0,
+      64.0,
+      256.0,
+      1024.0
+    ],
+    "pruning": "NonPruning"
+  },
+  {
+    "name": "smtp_client_transactions_total",
+    "help": "SMTP transactions started, distinguishing first use and reuse of a connection.",
+    "doc": null,
+    "metric_type": "Counter",
+    "label_names": [
+      "destination_relay_group",
+      "connection_use"
+    ],
     "buckets": [],
     "pruning": "NonPruning"
   },

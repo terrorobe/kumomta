@@ -7,9 +7,7 @@ use std::time::Duration;
 /// by the regular sink.  This should cause a connection failure
 /// for the first candidate, but we should then successfully
 /// deliver to the second candidate.
-#[tokio::test]
-async fn broken_first_choice_mx() -> anyhow::Result<()> {
-    let mut daemon = DaemonWithMaildir::start().await?;
+pub(super) async fn deliver_via_backup(daemon: &DaemonWithMaildir) -> anyhow::Result<()> {
     let mut client = daemon.smtp_client().await?;
 
     let response = MailGenParams {
@@ -21,17 +19,35 @@ async fn broken_first_choice_mx() -> anyhow::Result<()> {
     eprintln!("{response:?}");
     anyhow::ensure!(response.code == 250);
 
-    daemon
-        .wait_for_source_summary(
-            |summary| summary.get(&Delivery).copied().unwrap_or(0) >= 1,
-            Duration::from_secs(50),
-        )
-        .await;
+    assert!(
+        daemon
+            .wait_for_source_summary(|s| s.contains_key(&Delivery), Duration::from_secs(50))
+            .await,
+        "expected a source Delivery"
+    );
+    assert!(
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await,
+        "expected the backup to deliver to the maildir"
+    );
+    Ok(())
+}
 
-    daemon
-        .wait_for_maildir_count(1, Duration::from_secs(10))
-        .await;
-
+#[tokio::test]
+async fn broken_first_choice_mx() -> anyhow::Result<()> {
+    let mut daemon = DaemonWithMaildir::start().await?;
+    deliver_via_backup(&daemon).await?;
+    let setup = daemon
+        .source
+        .api_client()
+        .get_metrics(|m| {
+            m.name()
+                .starts_with("smtp_client_setup_")
+                .then(|| m.name().clone())
+        })
+        .await?;
+    assert!(setup.is_empty(), "telemetry disabled: {setup:?}");
     daemon.stop_both().await?;
 
     let delivery_summary = daemon.dump_logs().await?;
@@ -65,6 +81,7 @@ AccountingStats {
     let delivered = logs.iter().find(|record| record.kind == Delivery).unwrap();
 
     k9::assert_equal!(delivered.peer_address.as_ref().unwrap().name, "workinghost");
+    assert!(delivered.smtp.is_none());
 
     Ok(())
 }

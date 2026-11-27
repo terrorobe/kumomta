@@ -35,6 +35,7 @@ mod queue;
 mod ready_queue;
 mod smtp_dispatcher;
 mod smtp_server;
+mod smtp_telemetry;
 mod spf;
 mod spool;
 mod xfer;
@@ -398,6 +399,7 @@ async fn run(opts: Opt) -> anyhow::Result<()> {
         lua_funcs: &[
             kumo_server_common::register,
             crate::mod_kumo::register,
+            crate::smtp_telemetry::register,
             crate::spool::register,
             crate::logging::register,
             message::dkim::register,

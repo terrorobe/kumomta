@@ -16,7 +16,7 @@ use crate::queue::{
     DeliveryProto, IncrementAttempts, InsertContext, InsertReason, Queue, QueueConfig,
     QueueManager, QueueState,
 };
-use crate::smtp_dispatcher::SmtpDispatcher;
+use crate::smtp_dispatcher::{resolve_smtp_mx, SmtpDispatcher, Transaction};
 use crate::smtp_server::DeferredSmtpInjectionDispatcher;
 use crate::spool::SpoolManager;
 use crate::xfer::XferDispatcher;
@@ -321,7 +321,7 @@ impl ReadyQueueManager {
         let site_name = match &queue_config.borrow().protocol {
             DeliveryProto::Smtp { smtp } => {
                 if smtp.mx_list.is_empty() {
-                    mx.replace(MailExchanger::resolve(routing_domain).await?);
+                    mx.replace(resolve_smtp_mx(routing_domain).await?);
                     mx.as_ref().unwrap().site_name.to_string()
                 } else {
                     let mut mx_list = vec![];
@@ -1754,6 +1754,9 @@ pub struct Dispatcher {
     pub delivery_protocol: String,
     pub suspended: Option<AdminSuspendReadyQEntryRef>,
     pub session_id: Uuid,
+    /// Retain the wire result through per-recipient policy and spool operations.
+    /// An internal error after MAIL FROM still belongs to that transaction.
+    pub(crate) smtp_transaction: Option<Box<Transaction>>,
     leases: Vec<LimitLease>,
     batch_started: Option<tokio::time::Instant>,
     pub states: Arc<FairMutex<ReadyQueueStates>>,
@@ -1922,6 +1925,7 @@ impl Dispatcher {
             egress_pool,
             delivered_this_connection: 0,
             delivery_protocol,
+            smtp_transaction: None,
             leases,
             suspended: None,
             batch_started: None,
@@ -2187,7 +2191,9 @@ impl Dispatcher {
 
             let _timer_rollup = dispatcher.metrics.deliver_message_rollup.start_timer();
             dispatcher.enter_phase(DispatcherPhase::DeliveringMessage);
-            if let Err(err) = dispatcher.deliver_message(&mut *queue_dispatcher).await {
+            let result = dispatcher.deliver_message(&mut *queue_dispatcher).await;
+            let smtp_transaction = dispatcher.smtp_transaction.take();
+            if let Err(err) = result {
                 tracing::debug!("deliver_message: {err:#}");
                 for msg in dispatcher.msgs.drain(..) {
                     let response = Response {
@@ -2197,7 +2203,7 @@ impl Dispatcher {
                         command: None,
                     };
 
-                    log_disposition(LogDisposition {
+                    LogDisposition {
                         kind: RecordType::TransientFailure,
                         msg: msg.clone(),
                         site: &dispatcher.name,
@@ -2212,7 +2218,8 @@ impl Dispatcher {
                         provider: dispatcher.path_config.borrow().provider_name.as_deref(),
                         session_id: Some(dispatcher.session_id),
                         recipient_list: None,
-                    })
+                    }
+                    .log_smtp_internal_error(smtp_transaction.as_deref())
                     .await;
                     QueueManager::requeue_message(
                         msg,

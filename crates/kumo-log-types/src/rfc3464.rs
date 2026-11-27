@@ -897,6 +897,7 @@ Report {
             recipient: vec!["recip@target.example.com".to_string()],
             sender: "sender@sender.example.com".to_string(),
             session_id: None,
+            smtp: None,
             response: Response {
                 code: 550,
                 command: None,
@@ -941,6 +942,7 @@ Report {
             recipient: vec!["recip@target.example.com".to_string()],
             sender: "sender@sender.example.com".to_string(),
             session_id: None,
+            smtp: None,
             response: Response {
                 code: 551,
                 command: None,

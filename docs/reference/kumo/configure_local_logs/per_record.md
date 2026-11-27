@@ -44,15 +44,15 @@ kumo.configure_local_logs {
 
 The keys of the `per_record` table must correspond to one of the
 record types listed below, or the special `Any` key which can be used
-to match any record type that was not explicitly listed.  The values of
-the `per_record` table are `LogRecordParams` have the following fields
-and values:
+to match any message record type that was not explicitly listed. The values of
+the `per_record` table are `LogRecordParams` with the following fields:
 
 * `suffix` - a string to append to the generated segment file name.
   For example, `suffix = '.csv'` will generate names like `20230306-022811.csv`.
 * `log_dir` - specify an alternative log directory for this type
 * `enable` - defaults to `true`. If you set it to `false`, records of this
   type will not be logged
+* `slow_threshold` - optional duration for `SmtpConnection` only. See [SMTP connection records](#smtp-connection-records).
 * `segment_header` - ({{since('2023.11.28-b5252a41', inline=True)}}) text that will be written
   out to each newly opened segment file. Useful for emitting eg: a CSV header
   line.
@@ -90,4 +90,26 @@ named `X-FooBar` you would use `{{ headers['x-foobar'] }}` in your template.
     ```
     {% endraw %}
 
+## SMTP connection records
+
+{{since('dev')}}
+
+With [outbound SMTP client telemetry](../configure_smtp_client_telemetry.md) enabled, opt in to [connection records](../../log_record.md#smtp-connection-records) separately for each local file logger:
+
+```lua
+kumo.configure_local_logs {
+  log_dir = '/var/log/kumo',
+  per_record = {
+    SmtpConnection = { slow_threshold = '2s' },
+  },
+}
+```
+
+`Any` does not enable these records. Remove the `SmtpConnection` entry or set `enable = false` to turn them off.
+
+Without a `slow_threshold` (the default), the logger writes only empty address lists, failed attempts, and attempts with a negative peer reply, even if setup recovers. A threshold also selects an individual attempt or address-list build that took at least that long. It does not add durations across attempts. Reusing a connection does not generate a setup record.
+
+A local file logger discards a `SmtpConnection` record if its queue is full or closed, rather than delaying the next SMTP attempt or transaction. Each discarded submission increments [log_smtp_connection_dropped_total](../../metrics/kumod/log_smtp_connection_dropped_total.md) for that logger. Message dispositions still wait for queue capacity.
+
+The record's own `template`, `suffix`, `log_dir` and `segment_header` apply. Message headers, metadata and the message-based `filter_event` do not apply. Neither logging hook accepts `SmtpConnection`.
 
